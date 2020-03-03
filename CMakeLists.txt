@@ -14,7 +14,7 @@
 #        cd build
 # 3. Run cmake to generate project files for Windows, add more options to enable required third-party libraries.
 #    See thirdparty.inc for more information.
-#        sample command: cmake -G "Visual Studio 15 Win64" -DWITH_GFLAGS=1 -DWITH_SNAPPY=1 -DWITH_JEMALLOC=1 -DWITH_JNI=1 ..
+#        sample command: cmake -G "Visual Studio 15 Win64" -DCMAKE_BUILD_TYPE=Release -DWITH_GFLAGS=1 -DWITH_SNAPPY=1 -DWITH_JEMALLOC=1 -DWITH_JNI=1 ..
 # 4. Then build the project in debug mode (you may want to add /m[:<N>] flag to run msbuild in <N> parallel threads
 #                                          or simply /m to use all avail cores)
 #        msbuild rocksdb.sln
@@ -63,7 +63,12 @@ endif()
 # third-party/folly is only validated to work on Linux and Windows for now.
 # So only turn it on there by default.
 if(CMAKE_SYSTEM_NAME MATCHES "Linux" OR CMAKE_SYSTEM_NAME MATCHES "Windows")
-  option(WITH_FOLLY_DISTRIBUTED_MUTEX "build with folly::DistributedMutex" ON)
+  if(MSVC AND MSVC_VERSION LESS 1910)
+    # Folly does not compile with MSVC older than VS2017
+    option(WITH_FOLLY_DISTRIBUTED_MUTEX "build with folly::DistributedMutex" OFF)
+  else()
+    option(WITH_FOLLY_DISTRIBUTED_MUTEX "build with folly::DistributedMutex" ON)
+  endif()
 else()
   option(WITH_FOLLY_DISTRIBUTED_MUTEX "build with folly::DistributedMutex" OFF)
 endif()
@@ -174,7 +179,7 @@ else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -W -Wextra -Wall")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wsign-compare -Wshadow -Wno-unused-parameter -Wno-unused-variable -Woverloaded-virtual -Wnon-virtual-dtor -Wno-missing-field-initializers -Wno-strict-aliasing")
   if(MINGW)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-format")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-format -fno-asynchronous-unwind-tables")
     add_definitions(-D_POSIX_C_SOURCE=1)
   endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
@@ -481,6 +486,7 @@ set(SOURCES
         cache/clock_cache.cc
         cache/lru_cache.cc
         cache/sharded_cache.cc
+        db/arena_wrapped_db_iter.cc
         db/builder.cc
         db/c.cc
         db/column_family.cc
@@ -546,9 +552,15 @@ set(SOURCES
         env/env_hdfs.cc
         env/mock_env.cc
         file/delete_scheduler.cc
+        file/file_prefetch_buffer.cc
         file/file_util.cc
         file/filename.cc
+        file/random_access_file_reader.cc
+        file/read_write_util.cc
+        file/readahead_raf.cc
+        file/sequence_file_reader.cc
         file/sst_file_manager_impl.cc
+        file/writable_file_writer.cc
         logging/auto_roll_logger.cc
         logging/event_logger.cc
         logging/log_buffer.cc
@@ -592,9 +604,11 @@ set(SOURCES
         table/block_based/data_block_hash_index.cc
         table/block_based/data_block_footer.cc
         table/block_based/filter_block_reader_common.cc
+        table/block_based/filter_policy.cc
         table/block_based/flush_block_policy.cc
         table/block_based/full_filter_block.cc
         table/block_based/index_builder.cc
+        table/block_based/parsed_full_filter_block.cc
         table/block_based/partitioned_filter_block.cc
         table/block_based/uncompression_dict_reader.cc
         table/block_fetcher.cc
@@ -630,7 +644,6 @@ set(SOURCES
         tools/trace_analyzer_tool.cc
         trace_replay/trace_replay.cc
         trace_replay/block_cache_tracer.cc
-        util/bloom.cc
         util/coding.cc
         util/compaction_job_stats_impl.cc
         util/comparator.cc
@@ -638,8 +651,6 @@ set(SOURCES
         util/concurrent_task_limiter_impl.cc
         util/crc32c.cc
         util/dynamic_bloom.cc
-        util/file_reader_writer.cc
-        util/filter_policy.cc
         util/hash.cc
         util/murmurhash.cc
         util/random.cc
@@ -771,7 +782,7 @@ if(WITH_LIBRADOS)
 endif()
 
 if(WIN32)
-  set(SYSTEM_LIBS ${SYSTEM_LIBS} Shlwapi.lib Rpcrt4.lib)
+  set(SYSTEM_LIBS ${SYSTEM_LIBS} shlwapi.lib rpcrt4.lib)
   set(LIBS ${ROCKSDB_STATIC_LIB} ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
 else()
   set(SYSTEM_LIBS ${CMAKE_THREAD_LIBS_INIT})
@@ -879,7 +890,9 @@ if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
 endif()
 
 option(WITH_TESTS "build with tests" ON)
-if(WITH_TESTS)
+# For test libraries, utilities, and exes that are build iff WITH_TESTS=ON and
+# in Debug mode. Add test only code that is not #ifdefed for Release here.
+if(WITH_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
   set(TESTS
         cache/cache_test.cc
@@ -1034,23 +1047,6 @@ if(WITH_TESTS)
     list(APPEND TESTS third-party/folly/folly/synchronization/test/DistributedMutexTest.cpp)
   endif()
 
-  set(BENCHMARKS
-    cache/cache_bench.cc
-    memtable/memtablerep_bench.cc
-    db/range_del_aggregator_bench.cc
-    tools/db_bench.cc
-    table/table_reader_bench.cc
-    utilities/persistent_cache/hash_table_bench.cc)
-  add_library(testharness OBJECT test_util/testharness.cc)
-  foreach(sourcefile ${BENCHMARKS})
-    get_filename_component(exename ${sourcefile} NAME_WE)
-    add_executable(${exename}${ARTIFACT_SUFFIX} ${sourcefile}
-      $<TARGET_OBJECTS:testharness>)
-    target_link_libraries(${exename}${ARTIFACT_SUFFIX} gtest ${LIBS})
-  endforeach(sourcefile ${BENCHMARKS})
-
-  # For test util library that is build only in DEBUG mode
-  # and linked to tests. Add test only code that is not #ifdefed for Release here.
   set(TESTUTIL_SOURCE
       db/db_test_util.cc
       monitoring/thread_status_updater_debug.cc
@@ -1058,11 +1054,11 @@ if(WITH_TESTS)
       test_util/fault_injection_test_env.cc
       utilities/cassandra/test_utils.cc
   )
-  # test utilities are only build in debug
   enable_testing()
   add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND})
   set(TESTUTILLIB testutillib${ARTIFACT_SUFFIX})
   add_library(${TESTUTILLIB} STATIC ${TESTUTIL_SOURCE})
+  target_link_libraries(${TESTUTILLIB} ${LIBS})
   if(MSVC)
     set_target_properties(${TESTUTILLIB} PROPERTIES COMPILE_FLAGS "/Fd${CMAKE_CFG_INTDIR}/testutillib${ARTIFACT_SUFFIX}.pdb")
   endif()
@@ -1072,9 +1068,7 @@ if(WITH_TESTS)
         EXCLUDE_FROM_DEFAULT_BUILD_RELWITHDEBINFO 1
         )
 
-  # Tests are excluded from Release builds
   set(TEST_EXES ${TESTS})
-
   foreach(sourcefile ${TEST_EXES})
       get_filename_component(exename ${sourcefile} NAME_WE)
       add_executable(${CMAKE_PROJECT_NAME}_${exename}${ARTIFACT_SUFFIX} ${sourcefile}
@@ -1109,6 +1103,29 @@ if(WITH_TESTS)
       add_test(NAME ${exename} COMMAND ${exename}${ARTIFACT_SUFFIX})
       add_dependencies(check ${exename}${ARTIFACT_SUFFIX})
   endforeach(sourcefile ${C_TEST_EXES})
+endif()
+
+option(WITH_BENCHMARK_TOOLS "build with benchmarks" ON)
+if(WITH_BENCHMARK_TOOLS)
+  if(NOT TARGET gtest)
+    add_subdirectory(third-party/gtest-1.8.1/fused-src/gtest)
+  endif()
+  set(BENCHMARKS
+        cache/cache_bench.cc
+        memtable/memtablerep_bench.cc
+        db/range_del_aggregator_bench.cc
+        tools/db_bench.cc
+        table/table_reader_bench.cc
+        util/filter_bench.cc
+        utilities/persistent_cache/hash_table_bench.cc
+  )
+  add_library(testharness OBJECT test_util/testharness.cc)
+  foreach(sourcefile ${BENCHMARKS})
+    get_filename_component(exename ${sourcefile} NAME_WE)
+    add_executable(${exename}${ARTIFACT_SUFFIX} ${sourcefile}
+      $<TARGET_OBJECTS:testharness>)
+    target_link_libraries(${exename}${ARTIFACT_SUFFIX} gtest ${LIBS})
+  endforeach(sourcefile ${BENCHMARKS})
 endif()
 
 option(WITH_TOOLS "build with tools" ON)

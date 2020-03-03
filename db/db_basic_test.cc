@@ -11,6 +11,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/utilities/debug.h"
+#include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "test_util/fault_injection_test_env.h"
 #if !defined(ROCKSDB_LITE)
@@ -871,11 +872,12 @@ TEST_F(DBBasicTest, ChecksumTest) {
     ASSERT_OK(Flush());
   }
 
-  // verify data with each type of checksum
-  for (int i = 0; i <= kxxHash64; ++i) {
+  // with each valid checksum type setting...
+  for (int i = 0; i <= max_checksum; ++i) {
     table_options.checksum = static_cast<ChecksumType>(i);
     options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     Reopen(options);
+    // verify every type of checksum (should be regardless of that setting)
     for (int j = 0; j < (max_checksum + 1) * kNumPerFile; ++j) {
       ASSERT_EQ(Key(j), Get(Key(j)));
     }
@@ -913,30 +915,30 @@ TEST_F(DBBasicTest, MmapAndBufferOptions) {
 
 class TestEnv : public EnvWrapper {
   public:
-    explicit TestEnv() : EnvWrapper(Env::Default()),
-                close_count(0) { }
+   explicit TestEnv(Env* base_env) : EnvWrapper(base_env), close_count(0) {}
 
-    class TestLogger : public Logger {
-      public:
-        using Logger::Logv;
-        TestLogger(TestEnv *env_ptr) : Logger() { env = env_ptr; }
-        ~TestLogger() override {
-          if (!closed_) {
-            CloseHelper();
-          }
-        }
-        void Logv(const char* /*format*/, va_list /*ap*/) override{};
+   class TestLogger : public Logger {
+    public:
+     using Logger::Logv;
+     explicit TestLogger(TestEnv* env_ptr) : Logger() { env = env_ptr; }
+     ~TestLogger() override {
+       if (!closed_) {
+         CloseHelper();
+       }
+     }
+     void Logv(const char* /*format*/, va_list /*ap*/) override {}
 
-       protected:
-        Status CloseImpl() override { return CloseHelper(); }
+    protected:
+     Status CloseImpl() override { return CloseHelper(); }
 
-       private:
-        Status CloseHelper() {
-          env->CloseCountInc();;
-          return Status::IOError();
-        }
-        TestEnv *env;
-    };
+    private:
+     Status CloseHelper() {
+       env->CloseCountInc();
+       ;
+       return Status::IOError();
+     }
+     TestEnv* env;
+   };
 
     void CloseCountInc() { close_count++; }
 
@@ -958,7 +960,8 @@ TEST_F(DBBasicTest, DBClose) {
   ASSERT_OK(DestroyDB(dbname, options));
 
   DB* db = nullptr;
-  TestEnv* env = new TestEnv();
+  TestEnv* env = new TestEnv(env_);
+  std::unique_ptr<TestEnv> local_env_guard(env);
   options.create_if_missing = true;
   options.env = env;
   Status s = DB::Open(options, dbname, &db);
@@ -992,13 +995,11 @@ TEST_F(DBBasicTest, DBClose) {
   ASSERT_EQ(env->GetCloseCount(), 2);
   options.info_log.reset();
   ASSERT_EQ(env->GetCloseCount(), 3);
-
-  delete options.env;
 }
 
 TEST_F(DBBasicTest, DBCloseFlushError) {
   std::unique_ptr<FaultInjectionTestEnv> fault_injection_env(
-      new FaultInjectionTestEnv(Env::Default()));
+      new FaultInjectionTestEnv(env_));
   Options options = GetDefaultOptions();
   options.create_if_missing = true;
   options.manual_wal_flush = true;
@@ -1018,15 +1019,27 @@ TEST_F(DBBasicTest, DBCloseFlushError) {
   Destroy(options);
 }
 
-TEST_F(DBBasicTest, MultiGetMultiCF) {
+class DBMultiGetTestWithParam : public DBBasicTest,
+                                public testing::WithParamInterface<bool> {};
+
+TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"pikachu", "ilya", "muromec", "dobrynia", "nikitich",
                          "alyosha", "popovich"},
                         options);
+  // <CF, key, value> tuples
+  std::vector<std::tuple<int, std::string, std::string>> cf_kv_vec;
+  static const int num_keys = 24;
+  cf_kv_vec.reserve(num_keys);
 
-  for (int i = 0; i < 8; ++i) {
-    ASSERT_OK(Put(i, "cf" + std::to_string(i) + "_key",
-                  "cf" + std::to_string(i) + "_val"));
+  for (int i = 0; i < num_keys; ++i) {
+    int cf = i / 3;
+    int cf_key = 1 % 3;
+    cf_kv_vec.emplace_back(std::make_tuple(
+        cf, "cf" + std::to_string(cf) + "_key_" + std::to_string(cf_key),
+        "cf" + std::to_string(cf) + "_val_" + std::to_string(cf_key)));
+    ASSERT_OK(Put(std::get<0>(cf_kv_vec[i]), std::get<1>(cf_kv_vec[i]),
+                  std::get<2>(cf_kv_vec[i])));
   }
 
   int get_sv_count = 0;
@@ -1036,10 +1049,14 @@ TEST_F(DBBasicTest, MultiGetMultiCF) {
         if (++get_sv_count == 2) {
           // After MultiGet refs a couple of CFs, flush all CFs so MultiGet
           // is forced to repeat the process
-          for (int i = 0; i < 8; ++i) {
-            ASSERT_OK(Flush(i));
-            ASSERT_OK(Put(i, "cf" + std::to_string(i) + "_key",
-                          "cf" + std::to_string(i) + "_val2"));
+          for (int i = 0; i < num_keys; ++i) {
+            int cf = i / 3;
+            int cf_key = i % 8;
+            if (cf_key == 0) {
+              ASSERT_OK(Flush(cf));
+            }
+            ASSERT_OK(Put(std::get<0>(cf_kv_vec[i]), std::get<1>(cf_kv_vec[i]),
+                          std::get<2>(cf_kv_vec[i]) + "_2"));
           }
         }
         if (get_sv_count == 11) {
@@ -1057,26 +1074,53 @@ TEST_F(DBBasicTest, MultiGetMultiCF) {
   std::vector<std::string> keys;
   std::vector<std::string> values;
 
-  for (int i = 0; i < 8; ++i) {
-    cfs.push_back(i);
-    keys.push_back("cf" + std::to_string(i) + "_key");
+  for (int i = 0; i < num_keys; ++i) {
+    cfs.push_back(std::get<0>(cf_kv_vec[i]));
+    keys.push_back(std::get<1>(cf_kv_vec[i]));
   }
 
-  values = MultiGet(cfs, keys, nullptr);
-  ASSERT_EQ(values.size(), 8);
+  values = MultiGet(cfs, keys, nullptr, GetParam());
+  ASSERT_EQ(values.size(), num_keys);
   for (unsigned int j = 0; j < values.size(); ++j) {
-    ASSERT_EQ(values[j], "cf" + std::to_string(j) + "_val2");
+    ASSERT_EQ(values[j], std::get<2>(cf_kv_vec[j]) + "_2");
   }
-  for (int i = 0; i < 8; ++i) {
+
+  keys.clear();
+  cfs.clear();
+  cfs.push_back(std::get<0>(cf_kv_vec[0]));
+  keys.push_back(std::get<1>(cf_kv_vec[0]));
+  cfs.push_back(std::get<0>(cf_kv_vec[3]));
+  keys.push_back(std::get<1>(cf_kv_vec[3]));
+  cfs.push_back(std::get<0>(cf_kv_vec[4]));
+  keys.push_back(std::get<1>(cf_kv_vec[4]));
+  values = MultiGet(cfs, keys, nullptr, GetParam());
+  ASSERT_EQ(values[0], std::get<2>(cf_kv_vec[0]) + "_2");
+  ASSERT_EQ(values[1], std::get<2>(cf_kv_vec[3]) + "_2");
+  ASSERT_EQ(values[2], std::get<2>(cf_kv_vec[4]) + "_2");
+
+  keys.clear();
+  cfs.clear();
+  cfs.push_back(std::get<0>(cf_kv_vec[7]));
+  keys.push_back(std::get<1>(cf_kv_vec[7]));
+  cfs.push_back(std::get<0>(cf_kv_vec[6]));
+  keys.push_back(std::get<1>(cf_kv_vec[6]));
+  cfs.push_back(std::get<0>(cf_kv_vec[1]));
+  keys.push_back(std::get<1>(cf_kv_vec[1]));
+  values = MultiGet(cfs, keys, nullptr, GetParam());
+  ASSERT_EQ(values[0], std::get<2>(cf_kv_vec[7]) + "_2");
+  ASSERT_EQ(values[1], std::get<2>(cf_kv_vec[6]) + "_2");
+  ASSERT_EQ(values[2], std::get<2>(cf_kv_vec[1]) + "_2");
+
+  for (int cf = 0; cf < 8; ++cf) {
     auto* cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(
-                    reinterpret_cast<DBImpl*>(db_)->GetColumnFamilyHandle(i))
+                    reinterpret_cast<DBImpl*>(db_)->GetColumnFamilyHandle(cf))
                     ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVObsolete);
   }
 }
 
-TEST_F(DBBasicTest, MultiGetMultiCFMutex) {
+TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"pikachu", "ilya", "muromec", "dobrynia", "nikitich",
                          "alyosha", "popovich"},
@@ -1122,7 +1166,7 @@ TEST_F(DBBasicTest, MultiGetMultiCFMutex) {
     keys.push_back("cf" + std::to_string(i) + "_key");
   }
 
-  values = MultiGet(cfs, keys, nullptr);
+  values = MultiGet(cfs, keys, nullptr, GetParam());
   ASSERT_TRUE(last_try);
   ASSERT_EQ(values.size(), 8);
   for (unsigned int j = 0; j < values.size(); ++j) {
@@ -1137,7 +1181,7 @@ TEST_F(DBBasicTest, MultiGetMultiCFMutex) {
   }
 }
 
-TEST_F(DBBasicTest, MultiGetMultiCFSnapshot) {
+TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"pikachu", "ilya", "muromec", "dobrynia", "nikitich",
                          "alyosha", "popovich"},
@@ -1182,7 +1226,7 @@ TEST_F(DBBasicTest, MultiGetMultiCFSnapshot) {
   }
 
   const Snapshot* snapshot = db_->GetSnapshot();
-  values = MultiGet(cfs, keys, snapshot);
+  values = MultiGet(cfs, keys, snapshot, GetParam());
   db_->ReleaseSnapshot(snapshot);
   ASSERT_EQ(values.size(), 8);
   for (unsigned int j = 0; j < values.size(); ++j) {
@@ -1195,6 +1239,9 @@ TEST_F(DBBasicTest, MultiGetMultiCFSnapshot) {
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
   }
 }
+
+INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,
+                        testing::Bool());
 
 TEST_F(DBBasicTest, MultiGetBatchedSimpleUnsorted) {
   do {
@@ -1356,13 +1403,14 @@ TEST_F(DBBasicTest, MultiGetBatchedMultiLevel) {
 // Test class for batched MultiGet with prefix extractor
 // Param bool - If true, use partitioned filters
 //              If false, use full filter block
-class MultiGetPrefixExtractorTest
-    : public DBBasicTest,
-      public ::testing::WithParamInterface<bool> {};
+class MultiGetPrefixExtractorTest : public DBBasicTest,
+                                    public ::testing::WithParamInterface<bool> {
+};
 
 TEST_P(MultiGetPrefixExtractorTest, Batched) {
   Options options = CurrentOptions();
   options.prefix_extractor.reset(NewFixedPrefixTransform(2));
+  options.memtable_prefix_bloom_size_ratio = 10;
   BlockBasedTableOptions bbto;
   if (GetParam()) {
     bbto.index_type = BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
@@ -1374,17 +1422,30 @@ TEST_P(MultiGetPrefixExtractorTest, Batched) {
   options.table_factory.reset(NewBlockBasedTableFactory(bbto));
   Reopen(options);
 
+  SetPerfLevel(kEnableCount);
+  get_perf_context()->Reset();
+
   // First key is not in the prefix_extractor domain
   ASSERT_OK(Put("k", "v0"));
   ASSERT_OK(Put("kk1", "v1"));
   ASSERT_OK(Put("kk2", "v2"));
   ASSERT_OK(Put("kk3", "v3"));
   ASSERT_OK(Put("kk4", "v4"));
+  std::vector<std::string> mem_keys(
+      {"k", "kk1", "kk2", "kk3", "kk4", "rofl", "lmho"});
+  std::vector<std::string> inmem_values;
+  inmem_values = MultiGet(mem_keys, nullptr);
+  ASSERT_EQ(inmem_values[0], "v0");
+  ASSERT_EQ(inmem_values[1], "v1");
+  ASSERT_EQ(inmem_values[2], "v2");
+  ASSERT_EQ(inmem_values[3], "v3");
+  ASSERT_EQ(inmem_values[4], "v4");
+  ASSERT_EQ(get_perf_context()->bloom_memtable_miss_count, 2);
+  ASSERT_EQ(get_perf_context()->bloom_memtable_hit_count, 5);
   ASSERT_OK(Flush());
 
   std::vector<std::string> keys({"k", "kk1", "kk2", "kk3", "kk4"});
   std::vector<std::string> values;
-  SetPerfLevel(kEnableCount);
   get_perf_context()->Reset();
   values = MultiGet(keys, nullptr);
   ASSERT_EQ(values[0], "v0");
@@ -1396,14 +1457,12 @@ TEST_P(MultiGetPrefixExtractorTest, Batched) {
   ASSERT_EQ(get_perf_context()->bloom_sst_hit_count, 4);
 }
 
-INSTANTIATE_TEST_CASE_P(
-    MultiGetPrefix, MultiGetPrefixExtractorTest,
-    ::testing::Bool());
+INSTANTIATE_TEST_CASE_P(MultiGetPrefix, MultiGetPrefixExtractorTest,
+                        ::testing::Bool());
 
 #ifndef ROCKSDB_LITE
-class DBMultiGetRowCacheTest
-    : public DBBasicTest,
-      public ::testing::WithParamInterface<bool> {};
+class DBMultiGetRowCacheTest : public DBBasicTest,
+                               public ::testing::WithParamInterface<bool> {};
 
 TEST_P(DBMultiGetRowCacheTest, MultiGetBatched) {
   do {
@@ -1541,12 +1600,50 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
 }
 #endif  // !ROCKSDB_LITE
 
+TEST_F(DBBasicTest, MultiGetIOBufferOverrun) {
+  Options options = CurrentOptions();
+  Random rnd(301);
+  BlockBasedTableOptions table_options;
+  table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+  table_options.block_size = 16 * 1024;
+  assert(table_options.block_size >
+          BlockBasedTable::kMultiGetReadStackBufSize);
+  options.table_factory.reset(new BlockBasedTableFactory(table_options));
+  Reopen(options);
+
+  std::string zero_str(128, '\0');
+  for (int i = 0; i < 100; ++i) {
+    // Make the value compressible. A purely random string doesn't compress
+    // and the resultant data block will not be compressed
+    std::string value(RandomString(&rnd, 128) + zero_str);
+    assert(Put(Key(i), value) == Status::OK());
+  }
+  Flush();
+
+  std::vector<std::string> key_data(10);
+  std::vector<Slice> keys;
+  // We cannot resize a PinnableSlice vector, so just set initial size to
+  // largest we think we will need
+  std::vector<PinnableSlice> values(10);
+  std::vector<Status> statuses;
+  ReadOptions ro;
+
+  // Warm up the cache first
+  key_data.emplace_back(Key(0));
+  keys.emplace_back(Slice(key_data.back()));
+  key_data.emplace_back(Key(50));
+  keys.emplace_back(Slice(key_data.back()));
+  statuses.resize(keys.size());
+
+  dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
+                     keys.data(), values.data(), statuses.data(), true);
+}
+
 class DBBasicTestWithParallelIO
     : public DBTestBase,
-      public testing::WithParamInterface<std::tuple<bool,bool,bool,bool>> {
+      public testing::WithParamInterface<std::tuple<bool, bool, bool, bool>> {
  public:
-  DBBasicTestWithParallelIO()
-      : DBTestBase("/db_basic_test_with_parallel_io") {
+  DBBasicTestWithParallelIO() : DBTestBase("/db_basic_test_with_parallel_io") {
     bool compressed_cache = std::get<0>(GetParam());
     bool uncompressed_cache = std::get<1>(GetParam());
     compression_enabled_ = std::get<2>(GetParam());
@@ -1566,11 +1663,35 @@ class DBBasicTestWithParallelIO
     Options options = CurrentOptions();
     Random rnd(301);
     BlockBasedTableOptions table_options;
-    table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+
+#ifndef ROCKSDB_LITE
+    if (compression_enabled_) {
+      std::vector<CompressionType> compression_types;
+      compression_types = GetSupportedCompressions();
+      // Not every platform may have compression libraries available, so
+      // dynamically pick based on what's available
+      if (compression_types.size() == 0) {
+        compression_enabled_ = false;
+      } else {
+        options.compression = compression_types[0];
+      }
+    }
+#else
+    // GetSupportedCompressions() is not available in LITE build
+    if (!Snappy_Supported()) {
+      compression_enabled_ = false;
+    }
+#endif //ROCKSDB_LITE
+
     table_options.block_cache = uncompressed_cache_;
+    if (table_options.block_cache == nullptr) {
+      table_options.no_block_cache = true;
+    } else {
+      table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+    }
     table_options.block_cache_compressed = compressed_cache_;
     table_options.flush_block_policy_factory.reset(
-                      new MyFlushBlockPolicyFactory());
+        new MyFlushBlockPolicyFactory());
     options.table_factory.reset(new BlockBasedTableFactory(table_options));
     if (!compression_enabled_) {
       options.compression = kNoCompression;
@@ -1598,24 +1719,20 @@ class DBBasicTestWithParallelIO
   int num_found() { return uncompressed_cache_->num_found(); }
   int num_inserts() { return uncompressed_cache_->num_inserts(); }
 
-  int num_lookups_compressed() {
-    return compressed_cache_->num_lookups();
-  }
-  int num_found_compressed() {
-    return compressed_cache_->num_found();
-  }
-  int num_inserts_compressed() {
-    return compressed_cache_->num_inserts();
-  }
+  int num_lookups_compressed() { return compressed_cache_->num_lookups(); }
+  int num_found_compressed() { return compressed_cache_->num_found(); }
+  int num_inserts_compressed() { return compressed_cache_->num_inserts(); }
 
   bool fill_cache() { return fill_cache_; }
+  bool compression_enabled() { return compression_enabled_; }
+  bool has_compressed_cache() { return compressed_cache_ != nullptr; }
+  bool has_uncompressed_cache() { return uncompressed_cache_ != nullptr; }
 
   static void SetUpTestCase() {}
   static void TearDownTestCase() {}
 
  private:
-  class MyFlushBlockPolicyFactory
-    : public FlushBlockPolicyFactory {
+  class MyFlushBlockPolicyFactory : public FlushBlockPolicyFactory {
    public:
     MyFlushBlockPolicyFactory() {}
 
@@ -1630,11 +1747,10 @@ class DBBasicTestWithParallelIO
     }
   };
 
-  class MyFlushBlockPolicy
-    : public FlushBlockPolicy {
+  class MyFlushBlockPolicy : public FlushBlockPolicy {
    public:
     explicit MyFlushBlockPolicy(const BlockBuilder& data_block_builder)
-      : num_keys_(0), data_block_builder_(data_block_builder) {}
+        : num_keys_(0), data_block_builder_(data_block_builder) {}
 
     bool Update(const Slice& /*key*/, const Slice& /*value*/) override {
       if (data_block_builder_.empty()) {
@@ -1656,11 +1772,10 @@ class DBBasicTestWithParallelIO
     const BlockBuilder& data_block_builder_;
   };
 
-  class MyBlockCache
-    : public Cache {
+  class MyBlockCache : public Cache {
    public:
     explicit MyBlockCache(std::shared_ptr<Cache>& target)
-      : target_(target), num_lookups_(0), num_found_(0), num_inserts_(0) {}
+        : target_(target), num_lookups_(0), num_found_(0), num_inserts_(0) {}
 
     virtual const char* Name() const override { return "MyBlockCache"; }
 
@@ -1682,9 +1797,7 @@ class DBBasicTestWithParallelIO
       return handle;
     }
 
-    virtual bool Ref(Handle* handle) override {
-      return target_->Ref(handle);
-    }
+    virtual bool Ref(Handle* handle) override { return target_->Ref(handle); }
 
     virtual bool Release(Handle* handle, bool force_erase = false) override {
       return target_->Release(handle, force_erase);
@@ -1694,12 +1807,8 @@ class DBBasicTestWithParallelIO
       return target_->Value(handle);
     }
 
-    virtual void Erase(const Slice& key) override {
-      target_->Erase(key);
-    }
-    virtual uint64_t NewId() override {
-      return target_->NewId();
-    }
+    virtual void Erase(const Slice& key) override { target_->Erase(key); }
+    virtual uint64_t NewId() override { return target_->NewId(); }
 
     virtual void SetCapacity(size_t capacity) override {
       target_->SetCapacity(capacity);
@@ -1717,9 +1826,7 @@ class DBBasicTestWithParallelIO
       return target_->GetCapacity();
     }
 
-    virtual size_t GetUsage() const override {
-      return target_->GetUsage();
-    }
+    virtual size_t GetUsage() const override { return target_->GetUsage(); }
 
     virtual size_t GetUsage(Handle* handle) const override {
       return target_->GetUsage(handle);
@@ -1745,6 +1852,7 @@ class DBBasicTestWithParallelIO
     int num_found() { return num_found_; }
 
     int num_inserts() { return num_inserts_; }
+
    private:
     std::shared_ptr<Cache> target_;
     int num_lookups_;
@@ -1777,7 +1885,7 @@ TEST_P(DBBasicTestWithParallelIO, MultiGet) {
   statuses.resize(keys.size());
 
   dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-           keys.data(), values.data(), statuses.data(), true);
+                     keys.data(), values.data(), statuses.data(), true);
   ASSERT_TRUE(CheckValue(0, values[0].ToString()));
   ASSERT_TRUE(CheckValue(50, values[1].ToString()));
 
@@ -1789,16 +1897,25 @@ TEST_P(DBBasicTestWithParallelIO, MultiGet) {
   values[0].Reset();
   values[1].Reset();
   dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-           keys.data(), values.data(), statuses.data(), true);
+                     keys.data(), values.data(), statuses.data(), true);
   ASSERT_TRUE(CheckValue(1, values[0].ToString()));
   ASSERT_TRUE(CheckValue(51, values[1].ToString()));
 
-  int expected_reads = random_reads + (fill_cache() ? 0 : 2);
+  bool read_from_cache = false;
+  if (fill_cache()) {
+    if (has_uncompressed_cache()) {
+      read_from_cache = true;
+    } else if (has_compressed_cache() && compression_enabled()) {
+      read_from_cache = true;
+    }
+  }
+
+  int expected_reads = random_reads + (read_from_cache ? 0 : 2);
   ASSERT_EQ(env_->random_read_counter_.Read(), expected_reads);
 
   keys.resize(10);
   statuses.resize(10);
-  std::vector<int> key_ints{1,2,15,16,55,81,82,83,84,85};
+  std::vector<int> key_ints{1, 2, 15, 16, 55, 81, 82, 83, 84, 85};
   for (size_t i = 0; i < key_ints.size(); ++i) {
     key_data[i] = Key(key_ints[i]);
     keys[i] = Slice(key_data[i]);
@@ -1806,12 +1923,12 @@ TEST_P(DBBasicTestWithParallelIO, MultiGet) {
     values[i].Reset();
   }
   dbfull()->MultiGet(ro, dbfull()->DefaultColumnFamily(), keys.size(),
-           keys.data(), values.data(), statuses.data(), true);
+                     keys.data(), values.data(), statuses.data(), true);
   for (size_t i = 0; i < key_ints.size(); ++i) {
     ASSERT_OK(statuses[i]);
     ASSERT_TRUE(CheckValue(key_ints[i], values[i].ToString()));
   }
-  expected_reads += (fill_cache() ? 2 : 4);
+  expected_reads += (read_from_cache ? 2 : 4);
   ASSERT_EQ(env_->random_read_counter_.Read(), expected_reads);
 }
 
@@ -1822,12 +1939,8 @@ INSTANTIATE_TEST_CASE_P(
     // Param 1 - Uncompressed cache enabled
     // Param 2 - Data compression enabled
     // Param 3 - ReadOptions::fill_cache
-    ::testing::Values(std::make_tuple(false, true, true, true),
-                      std::make_tuple(true, true, true, true),
-                      std::make_tuple(false, true, false, true),
-                      std::make_tuple(false, true, true, false),
-                      std::make_tuple(true, true, true, false),
-                      std::make_tuple(false, true, false, false)));
+    ::testing::Combine(::testing::Bool(), ::testing::Bool(),
+                       ::testing::Bool(), ::testing::Bool()));
 
 class DBBasicTestWithTimestampWithParam
     : public DBTestBase,

@@ -30,6 +30,9 @@
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "file/filename.h"
+#include "file/random_access_file_reader.h"
+#include "file/read_write_util.h"
+#include "file/writable_file_writer.h"
 #include "monitoring/file_read_sample.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/persistent_stats_history.h"
@@ -47,7 +50,6 @@
 #include "table/two_level_iterator.h"
 #include "test_util/sync_point.h"
 #include "util/coding.h"
-#include "util/file_reader_writer.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "util/user_comparator_wrapper.h"
@@ -865,7 +867,8 @@ class LevelIterator final : public InternalIterator {
         icomparator_(icomparator),
         user_comparator_(icomparator.user_comparator()),
         flevel_(flevel),
-        prefix_extractor_(prefix_extractor),
+        prefix_extractor_(read_options.total_order_seek ? nullptr
+                                                        : prefix_extractor),
         file_read_hist_(file_read_hist),
         should_sample_(should_sample),
         caller_(caller),
@@ -932,7 +935,8 @@ class LevelIterator final : public InternalIterator {
   }
 
  private:
-  void SkipEmptyFileForward();
+  // Return true if at least one invalid file is seen and skipped.
+  bool SkipEmptyFileForward();
   void SkipEmptyFileBackward();
   void SetFileIterator(InternalIterator* iter);
   void InitFileIterator(size_t new_file_index);
@@ -1040,7 +1044,32 @@ void LevelIterator::Seek(const Slice& target) {
   if (file_iter_.iter() != nullptr) {
     file_iter_.Seek(target);
   }
-  SkipEmptyFileForward();
+  if (SkipEmptyFileForward() && prefix_extractor_ != nullptr &&
+      file_iter_.iter() != nullptr && file_iter_.Valid()) {
+    // We've skipped the file we initially positioned to. In the prefix
+    // seek case, it is likely that the file is skipped because of
+    // prefix bloom or hash, where more keys are skipped. We then check
+    // the current key and invalidate the iterator if the prefix is
+    // already passed.
+    // When doing prefix iterator seek, when keys for one prefix have
+    // been exhausted, it can jump to any key that is larger. Here we are
+    // enforcing a stricter contract than that, in order to make it easier for
+    // higher layers (merging and DB iterator) to reason the correctness:
+    // 1. Within the prefix, the result should be accurate.
+    // 2. If keys for the prefix is exhausted, it is either positioned to the
+    //    next key after the prefix, or make the iterator invalid.
+    // A side benefit will be that it invalidates the iterator earlier so that
+    // the upper level merging iterator can merge fewer child iterators.
+    Slice target_user_key = ExtractUserKey(target);
+    Slice file_user_key = ExtractUserKey(file_iter_.key());
+    if (prefix_extractor_->InDomain(target_user_key) &&
+        (!prefix_extractor_->InDomain(file_user_key) ||
+         user_comparator_.Compare(
+             prefix_extractor_->Transform(target_user_key),
+             prefix_extractor_->Transform(file_user_key)) != 0)) {
+      SetFileIterator(nullptr);
+    }
+  }
   CheckMayBeOutOfLowerBound();
 }
 
@@ -1094,25 +1123,28 @@ void LevelIterator::Prev() {
   SkipEmptyFileBackward();
 }
 
-void LevelIterator::SkipEmptyFileForward() {
+bool LevelIterator::SkipEmptyFileForward() {
+  bool seen_empty_file = false;
   while (file_iter_.iter() == nullptr ||
          (!file_iter_.Valid() && file_iter_.status().ok() &&
           !file_iter_.iter()->IsOutOfBound())) {
+    seen_empty_file = true;
     // Move to next file
     if (file_index_ >= flevel_->num_files - 1) {
       // Already at the last file
       SetFileIterator(nullptr);
-      return;
+      break;
     }
     if (KeyReachedUpperBound(file_smallest_key(file_index_ + 1))) {
       SetFileIterator(nullptr);
-      return;
+      break;
     }
     InitFileIterator(file_index_ + 1);
     if (file_iter_.iter() != nullptr) {
       file_iter_.SeekToFirst();
     }
   }
+  return seen_empty_file;
 }
 
 void LevelIterator::SkipEmptyFileBackward() {
@@ -1420,16 +1452,15 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
         assert(!ioptions->cf_paths.empty());
         file_path = ioptions->cf_paths.back().path;
       }
+      const uint64_t file_number = file->fd.GetNumber();
       files.emplace_back(SstFileMetaData{
-          MakeTableFileName("", file->fd.GetNumber()),
-          file_path,
-          static_cast<size_t>(file->fd.GetFileSize()),
-          file->fd.smallest_seqno,
-          file->fd.largest_seqno,
-          file->smallest.user_key().ToString(),
+          MakeTableFileName("", file_number), file_number, file_path,
+          static_cast<size_t>(file->fd.GetFileSize()), file->fd.smallest_seqno,
+          file->fd.largest_seqno, file->smallest.user_key().ToString(),
           file->largest.user_key().ToString(),
           file->stats.num_reads_sampled.load(std::memory_order_relaxed),
-          file->being_compacted});
+          file->being_compacted, file->oldest_blob_file_number,
+          file->TryGetOldestAncesterTime(), file->TryGetFileCreationTime()});
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
       level_size += file->fd.GetFileSize();
@@ -1448,6 +1479,24 @@ uint64_t Version::GetSstFilesSize() {
     }
   }
   return sst_files_size;
+}
+
+void Version::GetCreationTimeOfOldestFile(uint64_t* creation_time) {
+  uint64_t oldest_time = port::kMaxUint64;
+  for (int level = 0; level < storage_info_.num_non_empty_levels_; level++) {
+    for (FileMetaData* meta : storage_info_.LevelFiles(level)) {
+      assert(meta->fd.table_reader != nullptr);
+      uint64_t file_creation_time = meta->TryGetFileCreationTime();
+      if (file_creation_time == kUnknownFileCreationTime) {
+        *creation_time = 0;
+        return;
+      }
+      if (file_creation_time < oldest_time) {
+        oldest_time = file_creation_time;
+      }
+    }
+  }
+  *creation_time = oldest_time;
 }
 
 uint64_t VersionStorageInfo::GetEstimatedActiveKeys() const {
@@ -2281,13 +2330,11 @@ uint32_t GetExpiredTtlFilesCount(const ImmutableCFOptions& ioptions,
   auto status = ioptions.env->GetCurrentTime(&_current_time);
   if (status.ok()) {
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
-    for (auto f : files) {
-      if (!f->being_compacted && f->fd.table_reader != nullptr &&
-          f->fd.table_reader->GetTableProperties() != nullptr) {
-        auto creation_time =
-            f->fd.table_reader->GetTableProperties()->creation_time;
-        if (creation_time > 0 &&
-            creation_time < (current_time - mutable_cf_options.ttl)) {
+    for (FileMetaData* f : files) {
+      if (!f->being_compacted) {
+        uint64_t oldest_ancester_time = f->TryGetOldestAncesterTime();
+        if (oldest_ancester_time != 0 &&
+            oldest_ancester_time < (current_time - mutable_cf_options.ttl)) {
           ttl_expired_files_count++;
         }
       }
@@ -2439,12 +2486,11 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
   const uint64_t current_time = static_cast<uint64_t>(_current_time);
 
   for (int level = 0; level < num_levels() - 1; level++) {
-    for (auto f : files_[level]) {
-      if (!f->being_compacted && f->fd.table_reader != nullptr &&
-          f->fd.table_reader->GetTableProperties() != nullptr) {
-        auto creation_time =
-            f->fd.table_reader->GetTableProperties()->creation_time;
-        if (creation_time > 0 && creation_time < (current_time - ttl)) {
+    for (FileMetaData* f : files_[level]) {
+      if (!f->being_compacted) {
+        uint64_t oldest_ancester_time = f->TryGetOldestAncesterTime();
+        if (oldest_ancester_time > 0 &&
+            oldest_ancester_time < (current_time - ttl)) {
           expired_ttl_files_.emplace_back(level, f);
         }
       }
@@ -2465,26 +2511,30 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
     return;
   }
   const uint64_t current_time = static_cast<uint64_t>(temp_current_time);
+
+  // If periodic_compaction_seconds is larger than current time, periodic
+  // compaction can't possibly be triggered.
+  if (periodic_compaction_seconds > current_time) {
+    return;
+  }
+
   const uint64_t allowed_time_limit =
       current_time - periodic_compaction_seconds;
 
   for (int level = 0; level < num_levels(); level++) {
     for (auto f : files_[level]) {
-      if (!f->being_compacted && f->fd.table_reader != nullptr &&
-          f->fd.table_reader->GetTableProperties() != nullptr) {
+      if (!f->being_compacted) {
         // Compute a file's modification time in the following order:
         // 1. Use file_creation_time table property if it is > 0.
         // 2. Use creation_time table property if it is > 0.
         // 3. Use file's mtime metadata if the above two table properties are 0.
         // Don't consider the file at all if the modification time cannot be
         // correctly determined based on the above conditions.
-        uint64_t file_modification_time =
-            f->fd.table_reader->GetTableProperties()->file_creation_time;
-        if (file_modification_time == 0) {
-          file_modification_time =
-              f->fd.table_reader->GetTableProperties()->creation_time;
+        uint64_t file_modification_time = f->TryGetFileCreationTime();
+        if (file_modification_time == kUnknownFileCreationTime) {
+          file_modification_time = f->TryGetOldestAncesterTime();
         }
-        if (file_modification_time == 0) {
+        if (file_modification_time == kUnknownOldestAncesterTime) {
           auto file_path = TableFileName(ioptions.cf_paths, f->fd.GetNumber(),
                                          f->fd.GetPathId());
           status = ioptions.env->GetFileModificationTime(
@@ -3377,6 +3427,10 @@ std::string Version::DebugString(bool hex, bool print_stats) const {
       r.append(" .. ");
       r.append(files[i]->largest.DebugString(hex));
       r.append("]");
+      if (files[i]->oldest_blob_file_number != kInvalidBlobFileNumber) {
+        r.append(" blob_file:");
+        AppendNumberTo(&r, files[i]->oldest_blob_file_number);
+      }
       if (print_stats) {
         r.append("(");
         r.append(ToString(
@@ -3772,8 +3826,9 @@ Status VersionSet::ProcessManifestWrites(
                          rocksdb_kill_odds * REDUCE_ODDS2);
 #ifndef NDEBUG
         if (batch_edits.size() > 1 && batch_edits.size() - 1 == idx) {
-          TEST_SYNC_POINT(
-              "VersionSet::ProcessManifestWrites:BeforeWriteLastVersionEdit:0");
+          TEST_SYNC_POINT_CALLBACK(
+              "VersionSet::ProcessManifestWrites:BeforeWriteLastVersionEdit:0",
+              nullptr);
           TEST_SYNC_POINT(
               "VersionSet::ProcessManifestWrites:BeforeWriteLastVersionEdit:1");
         }
@@ -3887,12 +3942,15 @@ Status VersionSet::ProcessManifestWrites(
     for (auto v : versions) {
       delete v;
     }
+    // If manifest append failed for whatever reason, the file could be
+    // corrupted. So we need to force the next version update to start a
+    // new manifest file.
+    descriptor_log_.reset();
     if (new_descriptor_log) {
       ROCKS_LOG_INFO(db_options_->info_log,
                      "Deleting manifest %" PRIu64 " current manifest %" PRIu64
                      "\n",
                      manifest_file_number_, pending_manifest_file_number_);
-      descriptor_log_.reset();
       env_->DeleteFile(
           DescriptorFileName(dbname_, pending_manifest_file_number_));
     }
@@ -4921,7 +4979,8 @@ Status VersionSet::WriteCurrentStateToManifest(log::Writer* log) {
           edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
                        f->fd.GetFileSize(), f->smallest, f->largest,
                        f->fd.smallest_seqno, f->fd.largest_seqno,
-                       f->marked_for_compaction);
+                       f->marked_for_compaction, f->oldest_blob_file_number,
+                       f->oldest_ancester_time, f->file_creation_time);
         }
       }
       edit.SetLogNumber(cfd->GetLogNumber());
@@ -5329,7 +5388,9 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
           assert(!cfd->ioptions()->cf_paths.empty());
           filemetadata.db_path = cfd->ioptions()->cf_paths.back().path;
         }
-        filemetadata.name = MakeTableFileName("", file->fd.GetNumber());
+        const uint64_t file_number = file->fd.GetNumber();
+        filemetadata.name = MakeTableFileName("", file_number);
+        filemetadata.file_number = file_number;
         filemetadata.level = level;
         filemetadata.size = static_cast<size_t>(file->fd.GetFileSize());
         filemetadata.smallestkey = file->smallest.user_key().ToString();
@@ -5341,6 +5402,7 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.being_compacted = file->being_compacted;
         filemetadata.num_entries = file->num_entries;
         filemetadata.num_deletions = file->num_deletions;
+        filemetadata.oldest_blob_file_number = file->oldest_blob_file_number;
         metadata->push_back(filemetadata);
       }
     }
@@ -5724,7 +5786,8 @@ Status ReactiveVersionSet::ApplyOneVersionEditToBuilder(
     return Status::OK();
   }
   if (active_version_builders_.find(edit.column_family_) ==
-      active_version_builders_.end() && !cfd->IsDropped()) {
+          active_version_builders_.end() &&
+      !cfd->IsDropped()) {
     std::unique_ptr<BaseReferencedVersionBuilder> builder_guard(
         new BaseReferencedVersionBuilder(cfd));
     active_version_builders_.insert(

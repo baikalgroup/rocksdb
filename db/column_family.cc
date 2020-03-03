@@ -9,11 +9,11 @@
 
 #include "db/column_family.h"
 
-#include <cinttypes>
-#include <vector>
-#include <string>
 #include <algorithm>
+#include <cinttypes>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
@@ -30,6 +30,7 @@
 #include "memtable/hash_skiplist_rep.h"
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
+#include "port/port.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/merging_iterator.h"
 #include "util/autovector.h"
@@ -187,6 +188,11 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
   return Status::OK();
 }
 
+namespace {
+const uint64_t kDefaultTtl = 0xfffffffffffffffe;
+const uint64_t kDefaultPeriodicCompSecs = 0xfffffffffffffffe;
+};  // namespace
+
 ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
                                     const ColumnFamilyOptions& src) {
   ColumnFamilyOptions result = src;
@@ -340,6 +346,61 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
 
   if (result.max_compaction_bytes == 0) {
     result.max_compaction_bytes = result.target_file_size_base * 25;
+  }
+
+  bool is_block_based_table =
+      (result.table_factory->Name() == BlockBasedTableFactory().Name());
+
+  const uint64_t kAdjustedTtl = 30 * 24 * 60 * 60;
+  if (result.ttl == kDefaultTtl) {
+    if (is_block_based_table &&
+        result.compaction_style != kCompactionStyleFIFO) {
+      result.ttl = kAdjustedTtl;
+    } else {
+      result.ttl = 0;
+    }
+  }
+
+  const uint64_t kAdjustedPeriodicCompSecs = 30 * 24 * 60 * 60;
+
+  // Turn on periodic compactions and set them to occur once every 30 days if
+  // compaction filters are used and periodic_compaction_seconds is set to the
+  // default value.
+  if (result.compaction_style != kCompactionStyleFIFO) {
+    if ((result.compaction_filter != nullptr ||
+         result.compaction_filter_factory != nullptr) &&
+        result.periodic_compaction_seconds == kDefaultPeriodicCompSecs &&
+        is_block_based_table) {
+      result.periodic_compaction_seconds = kAdjustedPeriodicCompSecs;
+    }
+  } else {
+    // result.compaction_style == kCompactionStyleFIFO
+    if (result.ttl == 0) {
+      if (is_block_based_table) {
+        if (result.periodic_compaction_seconds == kDefaultPeriodicCompSecs) {
+          result.periodic_compaction_seconds = kAdjustedPeriodicCompSecs;
+        }
+        result.ttl = result.periodic_compaction_seconds;
+      }
+    } else if (result.periodic_compaction_seconds != 0) {
+      result.ttl = std::min(result.ttl, result.periodic_compaction_seconds);
+    }
+  }
+
+  // TTL compactions would work similar to Periodic Compactions in Universal in
+  // most of the cases. So, if ttl is set, execute the periodic compaction
+  // codepath.
+  if (result.compaction_style == kCompactionStyleUniversal && result.ttl != 0) {
+    if (result.periodic_compaction_seconds != 0) {
+      result.periodic_compaction_seconds =
+          std::min(result.ttl, result.periodic_compaction_seconds);
+    } else {
+      result.periodic_compaction_seconds = result.ttl;
+    }
+  }
+
+  if (result.periodic_compaction_seconds == kDefaultPeriodicCompSecs) {
+    result.periodic_compaction_seconds = 0;
   }
 
   return result;
@@ -929,8 +990,12 @@ bool ColumnFamilyData::NeedsCompaction() const {
 
 Compaction* ColumnFamilyData::PickCompaction(
     const MutableCFOptions& mutable_options, LogBuffer* log_buffer) {
+  SequenceNumber earliest_mem_seqno =
+      std::min(mem_->GetEarliestSequenceNumber(),
+               imm_.current()->GetEarliestSequenceNumber(false));
   auto* result = compaction_picker_->PickCompaction(
-      GetName(), mutable_options, current_->storage_info(), log_buffer);
+      GetName(), mutable_options, current_->storage_info(), log_buffer,
+      earliest_mem_seqno);
   if (result != nullptr) {
     result->SetInputVersion(current_);
   }
@@ -1015,9 +1080,8 @@ Compaction* ColumnFamilyData::CompactRange(
   return result;
 }
 
-SuperVersion* ColumnFamilyData::GetReferencedSuperVersion(
-    InstrumentedMutex* db_mutex) {
-  SuperVersion* sv = GetThreadLocalSuperVersion(db_mutex);
+SuperVersion* ColumnFamilyData::GetReferencedSuperVersion(DBImpl* db) {
+  SuperVersion* sv = GetThreadLocalSuperVersion(db);
   sv->Ref();
   if (!ReturnThreadLocalSuperVersion(sv)) {
     // This Unref() corresponds to the Ref() in GetThreadLocalSuperVersion()
@@ -1029,8 +1093,7 @@ SuperVersion* ColumnFamilyData::GetReferencedSuperVersion(
   return sv;
 }
 
-SuperVersion* ColumnFamilyData::GetThreadLocalSuperVersion(
-    InstrumentedMutex* db_mutex) {
+SuperVersion* ColumnFamilyData::GetThreadLocalSuperVersion(DBImpl* db) {
   // The SuperVersion is cached in thread local storage to avoid acquiring
   // mutex when SuperVersion does not change since the last use. When a new
   // SuperVersion is installed, the compaction or flush thread cleans up
@@ -1057,16 +1120,21 @@ SuperVersion* ColumnFamilyData::GetThreadLocalSuperVersion(
 
     if (sv && sv->Unref()) {
       RecordTick(ioptions_.statistics, NUMBER_SUPERVERSION_CLEANUPS);
-      db_mutex->Lock();
+      db->mutex()->Lock();
       // NOTE: underlying resources held by superversion (sst files) might
       // not be released until the next background job.
       sv->Cleanup();
-      sv_to_delete = sv;
+      if (db->immutable_db_options().avoid_unnecessary_blocking_io) {
+        db->AddSuperVersionsToFreeQueue(sv);
+        db->SchedulePurge();
+      } else {
+        sv_to_delete = sv;
+      }
     } else {
-      db_mutex->Lock();
+      db->mutex()->Lock();
     }
     sv = super_version_->Ref();
-    db_mutex->Unlock();
+    db->mutex()->Unlock();
 
     delete sv_to_delete;
   }
@@ -1168,24 +1236,15 @@ Status ColumnFamilyData::ValidateOptions(
     return s;
   }
 
-  if (cf_options.ttl > 0) {
-    if (db_options.max_open_files != -1) {
-      return Status::NotSupported(
-          "TTL is only supported when files are always "
-          "kept open (set max_open_files = -1). ");
-    }
+  if (cf_options.ttl > 0 && cf_options.ttl != kDefaultTtl) {
     if (cf_options.table_factory->Name() != BlockBasedTableFactory().Name()) {
       return Status::NotSupported(
           "TTL is only supported in Block-Based Table format. ");
     }
   }
 
-  if (cf_options.periodic_compaction_seconds > 0) {
-    if (db_options.max_open_files != -1) {
-      return Status::NotSupported(
-          "Periodic Compaction is only supported when files are always "
-          "kept open (set max_open_files = -1). ");
-    }
+  if (cf_options.periodic_compaction_seconds > 0 &&
+      cf_options.periodic_compaction_seconds != kDefaultPeriodicCompSecs) {
     if (cf_options.table_factory->Name() != BlockBasedTableFactory().Name()) {
       return Status::NotSupported(
           "Periodic Compaction is only supported in "

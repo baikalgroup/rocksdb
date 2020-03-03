@@ -740,6 +740,34 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setStatsPersistPeriodSec(
+      final int statsPersistPeriodSec) {
+    assert(isOwningHandle());
+    setStatsPersistPeriodSec(nativeHandle_, statsPersistPeriodSec);
+    return this;
+  }
+
+  @Override
+  public int statsPersistPeriodSec() {
+    assert(isOwningHandle());
+    return statsPersistPeriodSec(nativeHandle_);
+  }
+
+  @Override
+  public Options setStatsHistoryBufferSize(
+      final long statsHistoryBufferSize) {
+    assert(isOwningHandle());
+    setStatsHistoryBufferSize(nativeHandle_, statsHistoryBufferSize);
+    return this;
+  }
+
+  @Override
+  public long statsHistoryBufferSize() {
+    assert(isOwningHandle());
+    return statsHistoryBufferSize(nativeHandle_);
+  }
+
+  @Override
   public boolean adviseRandomOnOpen() {
     return adviseRandomOnOpen(nativeHandle_);
   }
@@ -884,6 +912,19 @@ public class Options extends RocksObject
   }
 
   @Override
+  public Options setStrictBytesPerSync(final boolean strictBytesPerSync) {
+    assert(isOwningHandle());
+    setStrictBytesPerSync(nativeHandle_, strictBytesPerSync);
+    return this;
+  }
+
+  @Override
+  public boolean strictBytesPerSync() {
+    assert(isOwningHandle());
+    return strictBytesPerSync(nativeHandle_);
+  }
+
+  @Override
   public Options setEnableThreadTracking(final boolean enableThreadTracking) {
     assert(isOwningHandle());
     setEnableThreadTracking(nativeHandle_, enableThreadTracking);
@@ -917,6 +958,17 @@ public class Options extends RocksObject
   @Override
   public boolean enablePipelinedWrite() {
     return enablePipelinedWrite(nativeHandle_);
+  }
+
+  @Override
+  public Options setUnorderedWrite(final boolean unorderedWrite) {
+    setUnorderedWrite(nativeHandle_, unorderedWrite);
+    return this;
+  }
+
+  @Override
+  public boolean unorderedWrite() {
+    return unorderedWrite(nativeHandle_);
   }
 
   @Override
@@ -1847,6 +1899,14 @@ public class Options extends RocksObject
   private native void setStatsDumpPeriodSec(
       long handle, int statsDumpPeriodSec);
   private native int statsDumpPeriodSec(long handle);
+  private native void setStatsPersistPeriodSec(
+      final long handle, final int statsPersistPeriodSec);
+  private native int statsPersistPeriodSec(
+      final long handle);
+  private native void setStatsHistoryBufferSize(
+      final long handle, final long statsHistoryBufferSize);
+  private native long statsHistoryBufferSize(
+      final long handle);
   private native void setAdviseRandomOnOpen(
       long handle, boolean adviseRandomOnOpen);
   private native boolean adviseRandomOnOpen(long handle);
@@ -1878,6 +1938,10 @@ public class Options extends RocksObject
   private native long bytesPerSync(long handle);
   private native void setWalBytesPerSync(long handle, long walBytesPerSync);
   private native long walBytesPerSync(long handle);
+  private native void setStrictBytesPerSync(
+      final long handle, final boolean strictBytesPerSync);
+  private native boolean strictBytesPerSync(
+      final long handle);
   private native void setEnableThreadTracking(long handle,
       boolean enableThreadTracking);
   private native boolean enableThreadTracking(long handle);
@@ -1886,6 +1950,9 @@ public class Options extends RocksObject
   private native void setEnablePipelinedWrite(final long handle,
       final boolean pipelinedWrite);
   private native boolean enablePipelinedWrite(final long handle);
+  private native void setUnorderedWrite(final long handle,
+      final boolean unorderedWrite);
+  private native boolean unorderedWrite(final long handle);
   private native void setAllowConcurrentMemtableWrite(long handle,
       boolean allowConcurrentMemtableWrite);
   private native boolean allowConcurrentMemtableWrite(long handle);

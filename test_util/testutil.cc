@@ -15,14 +15,16 @@
 #include <sstream>
 
 #include "db/memtable_list.h"
+#include "file/random_access_file_reader.h"
+#include "file/sequence_file_reader.h"
+#include "file/writable_file_writer.h"
 #include "port/port.h"
-#include "util/file_reader_writer.h"
 
 namespace rocksdb {
 namespace test {
 
 const uint32_t kDefaultFormatVersion = BlockBasedTableOptions().format_version;
-const uint32_t kLatestFormatVersion = 4u;
+const uint32_t kLatestFormatVersion = 5u;
 
 Slice RandomString(Random* rnd, int len, std::string* dst) {
   dst->resize(len);
