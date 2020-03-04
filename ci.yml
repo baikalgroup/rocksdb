@@ -1,9 +1,12 @@
 Global:
-    tool : bcloud
+    tool: bcloud
+
 Default:
-    profile : [rocksdb]
+    profile: [tag]
+
 Profiles:
     - profile:
-      name : rocksdb
-      command : bcloud build
-      release : true 
+      name: tag
+      command: bcloud build 
+      release: true
+
