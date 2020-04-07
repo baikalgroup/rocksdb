@@ -86,7 +86,7 @@ FlushJob::FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
                    const ImmutableDBOptions& db_options,
                    const MutableCFOptions& mutable_cf_options,
                    const uint64_t* max_memtable_id,
-                   const EnvOptions& env_options, VersionSet* versions,
+                   const FileOptions& file_options, VersionSet* versions,
                    InstrumentedMutex* db_mutex,
                    std::atomic<bool>* shutting_down,
                    std::vector<SequenceNumber> existing_snapshots,
@@ -103,7 +103,7 @@ FlushJob::FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
       db_options_(db_options),
       mutable_cf_options_(mutable_cf_options),
       max_memtable_id_(max_memtable_id),
-      env_options_(env_options),
+      file_options_(file_options),
       versions_(versions),
       db_mutex_(db_mutex),
       shutting_down_(shutting_down),
@@ -249,7 +249,8 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker,
   }
   RecordFlushIOStats();
 
-  auto stream = event_logger_->LogToBuffer(log_buffer_);
+  // When measure_io_stats_ is true, the default 512 bytes is not enough.
+  auto stream = event_logger_->LogToBuffer(log_buffer_, 1024);
   stream << "job" << job_context_->job_id << "event"
          << "flush_finished";
   stream << "output_compression"
@@ -371,8 +372,8 @@ Status FlushJob::WriteLevel0Table() {
       meta_.file_creation_time = current_time;
 
       s = BuildTable(
-          dbname_, db_options_.env, *cfd_->ioptions(), mutable_cf_options_,
-          env_options_, cfd_->table_cache(), iter.get(),
+          dbname_, db_options_.env, db_options_.fs.get(), *cfd_->ioptions(),
+          mutable_cf_options_, file_options_, cfd_->table_cache(), iter.get(),
           std::move(range_del_iters), &meta_, cfd_->internal_comparator(),
           cfd_->int_tbl_prop_collector_factories(), cfd_->GetID(),
           cfd_->GetName(), existing_snapshots_,

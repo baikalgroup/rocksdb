@@ -11,7 +11,6 @@
 
 #include <assert.h>
 #include <stdio.h>
-
 #include <list>
 #include <map>
 #include <memory>
@@ -426,6 +425,7 @@ struct BlockBasedTableBuilder::Rep {
       context.column_family_name = column_family_name;
       context.compaction_style = ioptions.compaction_style;
       context.level_at_creation = level_at_creation;
+      context.info_log = ioptions.info_log;
       filter_builder.reset(CreateFilterBlockBuilder(
           ioptions, moptions, context, use_delta_encoding_for_index_values,
           p_index_builder_));
@@ -1108,7 +1108,9 @@ void BlockBasedTableBuilder::EnterUnbuffered() {
 
     for (const auto& key : keys) {
       if (r->filter_builder != nullptr) {
-        r->filter_builder->Add(ExtractUserKey(key));
+        size_t ts_sz =
+            r->internal_comparator.user_comparator()->timestamp_size();
+        r->filter_builder->Add(ExtractUserKeyAndStripTimestamp(key, ts_sz));
       }
       r->index_builder->OnKeyAdded(key);
     }

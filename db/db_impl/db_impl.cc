@@ -52,6 +52,7 @@
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
+#include "env/composite_env_wrapper.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
@@ -102,6 +103,7 @@
 #include "util/string_util.h"
 
 namespace rocksdb {
+
 const std::string kDefaultColumnFamilyName("default");
 const std::string kPersistentStatsColumnFamilyName(
     "___rocksdb_stats_history___");
@@ -141,16 +143,15 @@ void DumpSupportInfo(Logger* logger) {
   ROCKS_LOG_HEADER(logger, "Fast CRC32 supported: %s",
                    crc32c::IsFastCrc32Supported().c_str());
 }
-
-int64_t kDefaultLowPriThrottledRate = 2 * 1024 * 1024;
 }  // namespace
 
 DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                const bool seq_per_batch, const bool batch_per_txn)
-    : env_(options.env),
-      dbname_(dbname),
+    : dbname_(dbname),
       own_info_log_(options.info_log == nullptr),
       initial_db_options_(SanitizeOptions(dbname, options)),
+      env_(initial_db_options_.env),
+      fs_(initial_db_options_.file_system),
       immutable_db_options_(initial_db_options_),
       mutable_db_options_(initial_db_options_),
       stats_(immutable_db_options_.statistics.get()),
@@ -158,9 +159,9 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
              immutable_db_options_.use_adaptive_mutex),
       default_cf_handle_(nullptr),
       max_total_in_memory_state_(0),
-      env_options_(BuildDBOptions(immutable_db_options_, mutable_db_options_)),
-      env_options_for_compaction_(env_->OptimizeForCompactionTableWrite(
-          env_options_, immutable_db_options_)),
+      file_options_(BuildDBOptions(immutable_db_options_, mutable_db_options_)),
+      file_options_for_compaction_(fs_->OptimizeForCompactionTableWrite(
+          file_options_, immutable_db_options_)),
       seq_per_batch_(seq_per_batch),
       batch_per_txn_(batch_per_txn),
       db_lock_(nullptr),
@@ -178,11 +179,6 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       write_thread_(immutable_db_options_),
       nonmem_write_thread_(immutable_db_options_),
       write_controller_(mutable_db_options_.delayed_write_rate),
-      // Use delayed_write_rate as a base line to determine the initial
-      // low pri write rate limit. It may be adjusted later.
-      low_pri_write_rate_limiter_(NewGenericRateLimiter(std::min(
-          static_cast<int64_t>(mutable_db_options_.delayed_write_rate / 8),
-          kDefaultLowPriThrottledRate))),
       last_batch_group_size_(0),
       unscheduled_flushes_(0),
       unscheduled_compactions_(0),
@@ -201,7 +197,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       unable_to_release_oldest_log_(false),
       num_running_ingest_file_(0),
 #ifndef ROCKSDB_LITE
-      wal_manager_(immutable_db_options_, env_options_, seq_per_batch),
+      wal_manager_(immutable_db_options_, file_options_, seq_per_batch),
 #endif  // ROCKSDB_LITE
       event_logger_(immutable_db_options_.info_log.get()),
       bg_work_paused_(0),
@@ -247,7 +243,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   co.metadata_charge_policy = kDontChargeCacheMetadata;
   table_cache_ = NewLRUCache(co);
 
-  versions_.reset(new VersionSet(dbname_, &immutable_db_options_, env_options_,
+  versions_.reset(new VersionSet(dbname_, &immutable_db_options_, file_options_,
                                  table_cache_.get(), write_buffer_manager_,
                                  &write_controller_, &block_cache_tracer_));
   column_family_memtables_.reset(
@@ -337,7 +333,7 @@ Status DBImpl::ResumeImpl() {
         mutex_.Unlock();
         s = FlushMemTable(cfd, flush_opts, FlushReason::kErrorRecovery);
         mutex_.Lock();
-        cfd->Unref();
+        cfd->UnrefAndTryDelete();
         if (!s.ok()) {
           break;
         }
@@ -425,7 +421,7 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
           mutex_.Unlock();
           FlushMemTable(cfd, FlushOptions(), FlushReason::kShutDown);
           mutex_.Lock();
-          cfd->Unref();
+          cfd->UnrefAndTryDelete();
         }
       }
     }
@@ -482,17 +478,12 @@ Status DBImpl::CloseHelper() {
   while (!flush_queue_.empty()) {
     const FlushRequest& flush_req = PopFirstFromFlushQueue();
     for (const auto& iter : flush_req) {
-      ColumnFamilyData* cfd = iter.first;
-      if (cfd->Unref()) {
-        delete cfd;
-      }
+      iter.first->UnrefAndTryDelete();
     }
   }
   while (!compaction_queue_.empty()) {
     auto cfd = PopFirstFromCompactionQueue();
-    if (cfd->Unref()) {
-      delete cfd;
-    }
+    cfd->UnrefAndTryDelete();
   }
 
   if (default_cf_handle_ != nullptr || persist_stats_cf_handle_ != nullptr) {
@@ -599,6 +590,7 @@ Status DBImpl::CloseHelper() {
       ret = s;
     }
   }
+
   if (ret.IsAborted()) {
     // Reserve IsAborted() error for those where users didn't release
     // certain resource and they can release them and come back and
@@ -1013,12 +1005,36 @@ Status DBImpl::SetDBOptions(
       }
     }
     if (s.ok()) {
-      if (new_options.max_background_compactions >
-          mutable_db_options_.max_background_compactions) {
-        env_->IncBackgroundThreadsIfNeeded(
-            new_options.max_background_compactions, Env::Priority::LOW);
+      const BGJobLimits current_bg_job_limits =
+          GetBGJobLimits(immutable_db_options_.max_background_flushes,
+                         mutable_db_options_.max_background_compactions,
+                         mutable_db_options_.max_background_jobs,
+                         /* parallelize_compactions */ true);
+      const BGJobLimits new_bg_job_limits = GetBGJobLimits(
+          immutable_db_options_.max_background_flushes,
+          new_options.max_background_compactions,
+          new_options.max_background_jobs, /* parallelize_compactions */ true);
+
+      const bool max_flushes_increased =
+          new_bg_job_limits.max_flushes > current_bg_job_limits.max_flushes;
+      const bool max_compactions_increased =
+          new_bg_job_limits.max_compactions >
+          current_bg_job_limits.max_compactions;
+
+      if (max_flushes_increased || max_compactions_increased) {
+        if (max_flushes_increased) {
+          env_->IncBackgroundThreadsIfNeeded(new_bg_job_limits.max_flushes,
+                                             Env::Priority::HIGH);
+        }
+
+        if (max_compactions_increased) {
+          env_->IncBackgroundThreadsIfNeeded(new_bg_job_limits.max_compactions,
+                                             Env::Priority::LOW);
+        }
+
         MaybeScheduleFlushOrCompaction();
       }
+
       if (new_options.stats_dump_period_sec !=
           mutable_db_options_.stats_dump_period_sec) {
         if (thread_dump_stats_) {
@@ -1059,14 +1075,14 @@ Status DBImpl::SetDBOptions(
       wal_changed = mutable_db_options_.wal_bytes_per_sync !=
                     new_options.wal_bytes_per_sync;
       mutable_db_options_ = new_options;
-      env_options_for_compaction_ = EnvOptions(new_db_options);
-      env_options_for_compaction_ = env_->OptimizeForCompactionTableWrite(
-          env_options_for_compaction_, immutable_db_options_);
-      versions_->ChangeEnvOptions(mutable_db_options_);
+      file_options_for_compaction_ = FileOptions(new_db_options);
+      file_options_for_compaction_ = fs_->OptimizeForCompactionTableWrite(
+          file_options_for_compaction_, immutable_db_options_);
+      versions_->ChangeFileOptions(mutable_db_options_);
       //TODO(xiez): clarify why apply optimize for read to write options
-      env_options_for_compaction_ = env_->OptimizeForCompactionTableRead(
-          env_options_for_compaction_, immutable_db_options_);
-      env_options_for_compaction_.compaction_readahead_size =
+      file_options_for_compaction_ = fs_->OptimizeForCompactionTableRead(
+          file_options_for_compaction_, immutable_db_options_);
+      file_options_for_compaction_.compaction_readahead_size =
           mutable_db_options_.compaction_readahead_size;
       WriteThread::Writer w;
       write_thread_.EnterUnbatched(&w, &mutex_);
@@ -1452,7 +1468,7 @@ InternalIterator* DBImpl::NewInternalIterator(const ReadOptions& read_options,
   if (s.ok()) {
     // Collect iterators for files in L0 - Ln
     if (read_options.read_tier != kMemtableTier) {
-      super_version->current->AddIterators(read_options, env_options_,
+      super_version->current->AddIterators(read_options, file_options_,
                                            &merge_iter_builder, range_del_agg);
     }
     internal_iter = merge_iter_builder.Finish();
@@ -2747,6 +2763,15 @@ const std::string& DBImpl::GetName() const { return dbname_; }
 
 Env* DBImpl::GetEnv() const { return env_; }
 
+FileSystem* DB::GetFileSystem() const {
+  static LegacyFileSystemWrapper fs_wrap(GetEnv());
+  return &fs_wrap;
+}
+
+FileSystem* DBImpl::GetFileSystem() const {
+  return immutable_db_options_.fs.get();
+}
+
 Options DBImpl::GetOptions(ColumnFamilyHandle* column_family) const {
   InstrumentedMutexLock l(&mutex_);
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
@@ -3327,12 +3352,12 @@ Status DBImpl::GetDbIdentity(std::string& identity) const {
 
 Status DBImpl::GetDbIdentityFromIdentityFile(std::string* identity) const {
   std::string idfilename = IdentityFileName(dbname_);
-  const EnvOptions soptions;
+  const FileOptions soptions;
   std::unique_ptr<SequentialFileReader> id_file_reader;
   Status s;
   {
-    std::unique_ptr<SequentialFile> idfile;
-    s = env_->NewSequentialFile(idfilename, &idfile, soptions);
+    std::unique_ptr<FSSequentialFile> idfile;
+    s = fs_->NewSequentialFile(idfilename, soptions, &idfile, nullptr);
     if (!s.ok()) {
       return s;
     }
@@ -3341,7 +3366,7 @@ Status DBImpl::GetDbIdentityFromIdentityFile(std::string* identity) const {
   }
 
   uint64_t file_size;
-  s = env_->GetFileSize(idfilename, &file_size);
+  s = fs_->GetFileSize(idfilename, IOOptions(), &file_size, nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -3415,7 +3440,12 @@ Status DBImpl::Close() {
 Status DB::ListColumnFamilies(const DBOptions& db_options,
                               const std::string& name,
                               std::vector<std::string>* column_families) {
-  return VersionSet::ListColumnFamilies(column_families, name, db_options.env);
+  FileSystem* fs = db_options.file_system.get();
+  LegacyFileSystemWrapper legacy_fs(db_options.env);
+  if (!fs) {
+    fs = &legacy_fs;
+  }
+  return VersionSet::ListColumnFamilies(column_families, name, fs);
 }
 
 Snapshot::~Snapshot() {}
@@ -3580,8 +3610,8 @@ Status DBImpl::WriteOptionsFile(bool need_mutex_lock,
 
   std::string file_name =
       TempOptionsFileName(GetName(), versions_->NewFileNumber());
-  Status s =
-      PersistRocksDBOptions(db_options, cf_names, cf_opts, file_name, GetEnv());
+  Status s = PersistRocksDBOptions(db_options, cf_names, cf_opts, file_name,
+                                   GetFileSystem());
 
   if (s.ok()) {
     s = RenameTempFileToOptionsFile(file_name);
@@ -3925,7 +3955,7 @@ Status DBImpl::IngestExternalFiles(
   for (const auto& arg : args) {
     auto* cfd = static_cast<ColumnFamilyHandleImpl*>(arg.column_family)->cfd();
     ingestion_jobs.emplace_back(
-        env_, versions_.get(), cfd, immutable_db_options_, env_options_,
+        env_, versions_.get(), cfd, immutable_db_options_, file_options_,
         &snapshots_, arg.options, &directories_, &event_logger_);
   }
   std::vector<std::pair<bool, Status>> exec_results;
@@ -3990,6 +4020,13 @@ Status DBImpl::IngestExternalFiles(
     if (two_write_queues_) {
       nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
     }
+
+    // When unordered_write is enabled, the keys are writing to memtable in an
+    // unordered way. If the ingestion job checks memtable key range before the
+    // key landing in memtable, the ingestion job may skip the necessary
+    // memtable flush.
+    // So wait here to ensure there is no pending write to memtable.
+    WaitForPendingWrites();
 
     num_running_ingest_file_ += static_cast<int>(num_cfs);
     TEST_SYNC_POINT("DBImpl::IngestExternalFile:AfterIncIngestFileCounter");
@@ -4182,7 +4219,7 @@ Status DBImpl::CreateColumnFamilyWithImport(
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(*handle);
   auto cfd = cfh->cfd();
   ImportColumnFamilyJob import_job(env_, versions_.get(), cfd,
-                                   immutable_db_options_, env_options_,
+                                   immutable_db_options_, file_options_,
                                    import_options, metadata.files);
 
   SuperVersionContext dummy_sv_ctx(/* create_superversion */ true);
@@ -4312,7 +4349,7 @@ Status DBImpl::VerifyChecksum(const ReadOptions& read_options) {
         const auto& fd = vstorage->LevelFilesBrief(i).files[j].fd;
         std::string fname = TableFileName(cfd->ioptions()->cf_paths,
                                           fd.GetNumber(), fd.GetPathId());
-        s = rocksdb::VerifySstFileChecksum(opts, env_options_, read_options,
+        s = rocksdb::VerifySstFileChecksum(opts, file_options_, read_options,
                                            fname);
       }
     }
@@ -4338,7 +4375,7 @@ Status DBImpl::VerifyChecksum(const ReadOptions& read_options) {
       SchedulePurge();
     }
     for (auto cfd : cfd_list) {
-      cfd->Unref();
+      cfd->UnrefAndTryDelete();
     }
   }
   return s;
@@ -4458,13 +4495,21 @@ Status DBImpl::GetCreationTimeOfOldestFile(uint64_t* creation_time) {
   if (mutable_db_options_.max_open_files == -1) {
     uint64_t oldest_time = port::kMaxUint64;
     for (auto cfd : *versions_->GetColumnFamilySet()) {
-      uint64_t ctime;
-      cfd->current()->GetCreationTimeOfOldestFile(&ctime);
-      if (ctime < oldest_time) {
-        oldest_time = ctime;
-      }
-      if (oldest_time == 0) {
-        break;
+      if (!cfd->IsDropped()) {
+        uint64_t ctime;
+        {
+          SuperVersion* sv = GetAndRefSuperVersion(cfd);
+          Version* version = sv->current;
+          version->GetCreationTimeOfOldestFile(&ctime);
+          ReturnAndCleanupSuperVersion(cfd, sv);
+        }
+
+        if (ctime < oldest_time) {
+          oldest_time = ctime;
+        }
+        if (oldest_time == 0) {
+          break;
+        }
       }
     }
     *creation_time = oldest_time;
