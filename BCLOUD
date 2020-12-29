@@ -10,7 +10,7 @@ COMPILER('gcc82')
 #Preprocessor flags.
 CPPFLAGS(r'-D_GNU_SOURCE -D__STDC_LIMIT_MACROS')
 CPPFLAGS(r'-DVERSION=\"%s\"' % SVN_LAST_CHANGED_REV())
-CPPFLAGS(r'-DNDEBUG -O2 -fno-omit-frame-pointer -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX  -DOS_LINUX -fno-builtin-memcmp -DROCKSDB_FALLOCATE_PRESENT -DSNAPPY -DGFLAGS=google -DZLIB -DBZIP2 -DROCKSDB_MALLOC_USABLE_SIZE -DROCKSDB_SCHED_GETCPU_PRESENT -DHAVE_SSE42')
+CPPFLAGS(r'-DNDEBUG -O2 -fno-omit-frame-pointer -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX  -DOS_LINUX -fno-builtin-memcmp -DROCKSDB_FALLOCATE_PRESENT -DSNAPPY -DGFLAGS=google -DLZ4 -DZSTD -DZLIB -DBZIP2 -DROCKSDB_MALLOC_USABLE_SIZE -DROCKSDB_SCHED_GETCPU_PRESENT -DHAVE_SSE42')
 
 #C flags.
 CFLAGS('-pipe -g -ggdb -W -Wall -fPIC')
@@ -28,6 +28,8 @@ LDFLAGS('-lpthread -lrt -lz ')
 CONFIGS('thirdsrc/snappy@snappy_1-0-5-100_PD_BL')
 CONFIGS('thirdsrc/gflags@gflags_2-0-0-100_PD_BL')
 CONFIGS("baidu/third-party/bzip2@bzip2_V1.0.8.1_GCC820_4U3_K3_GEN_PD_BL@git_tag")   
+CONFIGS("baidu/third-party/zstd@zstd_V1.4.4.1_GCC820_6U3_K2_GEN_PD_BL@git_branch")   
+CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@git_tag")
 
 LIB_SOURCES="""
   cache/clock_cache.cc                                          \
