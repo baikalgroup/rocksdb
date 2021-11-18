@@ -13,6 +13,7 @@
 #include "db_stress_tool/db_stress_shared_state.h"
 
 namespace ROCKSDB_NAMESPACE {
+class SystemClock;
 class Transaction;
 class TransactionDB;
 
@@ -22,12 +23,16 @@ class StressTest {
 
   virtual ~StressTest();
 
-  std::shared_ptr<Cache> NewCache(size_t capacity);
+  std::shared_ptr<Cache> NewCache(size_t capacity, int32_t num_shard_bits);
+
+  static std::vector<std::string> GetBlobCompressionTags();
 
   bool BuildOptionsTable();
 
   void InitDb();
-  void InitReadonlyDb(SharedState*);
+  // The initialization work is split into two parts to avoid a circular
+  // dependency with `SharedState`.
+  void FinishInitDb(SharedState*);
 
   // Return false if verification fails.
   bool VerifySecondaries();
@@ -184,7 +189,11 @@ class StressTest {
 
   Status MaybeReleaseSnapshots(ThreadState* thread, uint64_t i);
 #ifndef ROCKSDB_LITE
-  Status VerifyGetLiveAndWalFiles(ThreadState* thread);
+  Status VerifyGetLiveFiles() const;
+  Status VerifyGetSortedWalFiles() const;
+  Status VerifyGetCurrentWalFile() const;
+  void TestGetProperty(ThreadState* thread) const;
+
   virtual Status TestApproximateSize(
       ThreadState* thread, uint64_t iteration,
       const std::vector<int>& rand_column_families,
@@ -202,6 +211,8 @@ class StressTest {
 
   void Reopen(ThreadState* thread);
 
+  void CheckAndSetOptionsForUserTimestamp();
+
   std::shared_ptr<Cache> cache_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
@@ -210,6 +221,7 @@ class StressTest {
   TransactionDB* txn_db_;
 #endif
   Options options_;
+  SystemClock* clock_;
   std::vector<ColumnFamilyHandle*> column_families_;
   std::vector<std::string> column_family_names_;
   std::atomic<int> new_column_family_name_;
@@ -225,6 +237,7 @@ class StressTest {
   // Fields used for continuous verification from another thread
   DB* cmp_db_;
   std::vector<ColumnFamilyHandle*> cmp_cfhs_;
+  bool is_db_stopped_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

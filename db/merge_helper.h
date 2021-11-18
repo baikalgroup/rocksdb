@@ -9,12 +9,12 @@
 #include <string>
 #include <vector>
 
-#include "db/dbformat.h"
 #include "db/merge_context.h"
 #include "db/range_del_aggregator.h"
 #include "db/snapshot_checker.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/env.h"
+#include "rocksdb/merge_operator.h"
 #include "rocksdb/slice.h"
 #include "util/stop_watch.h"
 
@@ -25,6 +25,8 @@ class Iterator;
 class Logger;
 class MergeOperator;
 class Statistics;
+class SystemClock;
+class Version;
 
 class MergeHelper {
  public:
@@ -48,7 +50,7 @@ class MergeHelper {
                                const Slice& key, const Slice* value,
                                const std::vector<Slice>& operands,
                                std::string* result, Logger* logger,
-                               Statistics* statistics, Env* env,
+                               Statistics* statistics, SystemClock* clock,
                                Slice* result_operand = nullptr,
                                bool update_num_ops_stats = false);
 
@@ -66,6 +68,8 @@ class MergeHelper {
   //                   0 means no restriction
   // at_bottom:   (IN) true if the iterator covers the bottem level, which means
   //                   we could reach the start of the history of this user key.
+  // allow_data_in_errors: (IN) if true, data details will be displayed in
+  //                   error/log messages.
   //
   // Returns one of the following statuses:
   // - OK: Entries were successfully merged.
@@ -80,7 +84,9 @@ class MergeHelper {
   Status MergeUntil(InternalIterator* iter,
                     CompactionRangeDelAggregator* range_del_agg = nullptr,
                     const SequenceNumber stop_before = 0,
-                    const bool at_bottom = false);
+                    const bool at_bottom = false,
+                    const bool allow_data_in_errors = false,
+                    Version* version = nullptr);
 
   // Filters a merge operand using the compaction filter specified
   // in the constructor. Returns the decision that the filter made.
@@ -137,6 +143,7 @@ class MergeHelper {
 
  private:
   Env* env_;
+  SystemClock* clock_;
   const Comparator* user_comparator_;
   const MergeOperator* user_merge_operator_;
   const CompactionFilter* compaction_filter_;

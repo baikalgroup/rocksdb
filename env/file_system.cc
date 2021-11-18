@@ -3,9 +3,11 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
-#include "env/composite_env_wrapper.h"
 #include "rocksdb/file_system.h"
+
+#include "env/composite_env_wrapper.h"
 #include "options/db_options.h"
+#include "rocksdb/convenience.h"
 #include "rocksdb/utilities/object_registry.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -16,14 +18,34 @@ FileSystem::~FileSystem() {}
 
 Status FileSystem::Load(const std::string& value,
                         std::shared_ptr<FileSystem>* result) {
+  return CreateFromString(ConfigOptions(), value, result);
+}
+
+Status FileSystem::CreateFromString(const ConfigOptions& config_options,
+                                    const std::string& value,
+                                    std::shared_ptr<FileSystem>* result) {
   Status s;
 #ifndef ROCKSDB_LITE
+  (void)config_options;
   s = ObjectRegistry::NewInstance()->NewSharedObject<FileSystem>(value, result);
 #else
+  (void)config_options;
   (void)result;
-  s = Status::NotSupported("Cannot load FileSystem in LITE mode: ", value);
+  s = Status::NotSupported("Cannot load FileSystem in LITE mode", value);
 #endif
   return s;
+}
+
+IOStatus FileSystem::ReuseWritableFile(const std::string& fname,
+                                       const std::string& old_fname,
+                                       const FileOptions& opts,
+                                       std::unique_ptr<FSWritableFile>* result,
+                                       IODebugContext* dbg) {
+  IOStatus s = RenameFile(old_fname, fname, opts.io_options, dbg);
+  if (!s.ok()) {
+    return s;
+  }
+  return NewWritableFile(fname, opts, result, dbg);
 }
 
 FileOptions FileSystem::OptimizeForLogRead(
@@ -71,12 +93,39 @@ FileOptions FileSystem::OptimizeForCompactionTableRead(
   return optimized_file_options;
 }
 
-Status ReadFileToString(FileSystem* fs, const std::string& fname,
-                        std::string* data) {
+FileOptions FileSystem::OptimizeForBlobFileRead(
+    const FileOptions& file_options,
+    const ImmutableDBOptions& db_options) const {
+  FileOptions optimized_file_options(file_options);
+  optimized_file_options.use_direct_reads = db_options.use_direct_reads;
+  return optimized_file_options;
+}
+
+IOStatus WriteStringToFile(FileSystem* fs, const Slice& data,
+                           const std::string& fname, bool should_sync) {
+  std::unique_ptr<FSWritableFile> file;
+  EnvOptions soptions;
+  IOStatus s = fs->NewWritableFile(fname, soptions, &file, nullptr);
+  if (!s.ok()) {
+    return s;
+  }
+  s = file->Append(data, IOOptions(), nullptr);
+  if (s.ok() && should_sync) {
+    s = file->Sync(IOOptions(), nullptr);
+  }
+  if (!s.ok()) {
+    fs->DeleteFile(fname, IOOptions(), nullptr);
+  }
+  return s;
+}
+
+IOStatus ReadFileToString(FileSystem* fs, const std::string& fname,
+                          std::string* data) {
   FileOptions soptions;
   data->clear();
   std::unique_ptr<FSSequentialFile> file;
-  Status s = fs->NewSequentialFile(fname, soptions, &file, nullptr);
+  IOStatus s = status_to_io_status(
+      fs->NewSequentialFile(fname, soptions, &file, nullptr));
   if (!s.ok()) {
     return s;
   }
@@ -97,14 +146,5 @@ Status ReadFileToString(FileSystem* fs, const std::string& fname,
   delete[] space;
   return s;
 }
-
-#ifdef OS_WIN
-std::shared_ptr<FileSystem> FileSystem::Default() {
-  static LegacyFileSystemWrapper default_fs(Env::Default());
-  static std::shared_ptr<LegacyFileSystemWrapper> default_fs_ptr(
-      &default_fs, [](LegacyFileSystemWrapper*) {});
-  return default_fs_ptr;
-}
-#endif
 
 }  // namespace ROCKSDB_NAMESPACE

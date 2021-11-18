@@ -611,9 +611,9 @@ public class Transaction extends RocksObject {
   }
 
   /**
-   * Returns an iterator that will iterate on all keys in the default
-   * column family including both keys in the DB and uncommitted keys in this
-   * transaction.
+   * Returns an iterator that will iterate on all keys in the column family
+   * specified by {@code columnFamilyHandle} including both keys in the DB
+   * and uncommitted keys in this transaction.
    *
    * Setting {@link ReadOptions#setSnapshot(Snapshot)} will affect what is read
    * from the DB but will NOT change which keys are read from this transaction
@@ -1788,10 +1788,16 @@ public class Transaction extends RocksObject {
     AWAITING_PREPARE((byte)1),
     PREPARED((byte)2),
     AWAITING_COMMIT((byte)3),
-    COMMITED((byte)4),
+    COMMITTED((byte)4),
     AWAITING_ROLLBACK((byte)5),
     ROLLEDBACK((byte)6),
     LOCKS_STOLEN((byte)7);
+
+    /*
+     * Keep old misspelled variable as alias
+     * Tip from https://stackoverflow.com/a/37092410/454544
+     */
+    public static final TransactionState COMMITED = COMMITTED;
 
     private final byte value;
 

@@ -7,24 +7,23 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#if !defined(OS_WIN) && !defined(WIN32) && !defined(_WIN32)
-#error Windows Specific Code
-#endif
+#if defined(OS_WIN)
 
 #include "port/win/port_win.h"
 
-#include <io.h>
-#include "port/port_dirent.h"
-#include "port/sys_time.h"
-
-#include <cstdlib>
-#include <stdio.h>
 #include <assert.h>
+#include <io.h>
+#include <rpc.h>
+#include <stdio.h>
 #include <string.h>
 
-#include <memory>
-#include <exception>
 #include <chrono>
+#include <cstdlib>
+#include <exception>
+#include <memory>
+
+#include "port/port_dirent.h"
+#include "port/sys_time.h"
 
 #ifdef ROCKSDB_WINDOWS_UTF8_FILENAMES
 // utf8 <-> utf16
@@ -100,6 +99,15 @@ bool CondVar::TimedWait(uint64_t abs_time_us) {
 
   // Caller must ensure that mutex is held prior to calling this method
   std::unique_lock<std::mutex> lk(mu_->getLock(), std::adopt_lock);
+
+  // Work around https://github.com/microsoft/STL/issues/369
+#if defined(_MSC_VER) && \
+    (!defined(_MSVC_STL_UPDATE) || _MSVC_STL_UPDATE < 202008L)
+  if (relTimeUs == microseconds::zero()) {
+    lk.unlock();
+    lk.lock();
+  }
+#endif
 #ifndef NDEBUG
   mu_->locked_ = false;
 #endif
@@ -159,20 +167,19 @@ DIR* opendir(const char* name) {
 
   std::unique_ptr<DIR> dir(new DIR);
 
-  dir->handle_ = RX_FindFirstFileEx(RX_FN(pattern).c_str(), 
-    FindExInfoBasic, // Do not want alternative name
-    &dir->data_,
-    FindExSearchNameMatch,
-    NULL, // lpSearchFilter
-    0);
+  dir->handle_ =
+      RX_FindFirstFileEx(RX_FN(pattern).c_str(),
+                         FindExInfoBasic,  // Do not want alternative name
+                         &dir->data_, FindExSearchNameMatch,
+                         NULL,  // lpSearchFilter
+                         0);
 
   if (dir->handle_ == INVALID_HANDLE_VALUE) {
     return nullptr;
   }
 
   RX_FILESTRING x(dir->data_.cFileName, RX_FNLEN(dir->data_.cFileName));
-  strcpy_s(dir->entry_.d_name, sizeof(dir->entry_.d_name), 
-           FN_TO_RX(x).c_str());
+  strcpy_s(dir->entry_.d_name, sizeof(dir->entry_.d_name), FN_TO_RX(x).c_str());
 
   return dir.release();
 }
@@ -195,7 +202,7 @@ struct dirent* readdir(DIR* dirp) {
   }
 
   RX_FILESTRING x(dirp->data_.cFileName, RX_FNLEN(dirp->data_.cFileName));
-  strcpy_s(dirp->entry_.d_name, sizeof(dirp->entry_.d_name), 
+  strcpy_s(dirp->entry_.d_name, sizeof(dirp->entry_.d_name),
            FN_TO_RX(x).c_str());
 
   return &dirp->entry_;
@@ -265,5 +272,34 @@ int GetMaxOpenFiles() { return -1; }
 // Assume 4KB page size
 const size_t kPageSize = 4U * 1024U;
 
+void SetCpuPriority(ThreadId id, CpuPriority priority) {
+  // Not supported
+  (void)id;
+  (void)priority;
+}
+
+int64_t GetProcessID() { return GetCurrentProcessId(); }
+
+bool GenerateRfcUuid(std::string* output) {
+  UUID uuid;
+  UuidCreateSequential(&uuid);
+
+  RPC_CSTR rpc_str;
+  auto status = UuidToStringA(&uuid, &rpc_str);
+  if (status != RPC_S_OK) {
+    return false;
+  }
+
+  // rpc_str is nul-terminated
+  *output = reinterpret_cast<char*>(rpc_str);
+
+  status = RpcStringFreeA(&rpc_str);
+  assert(status == RPC_S_OK);
+
+  return true;
+}
+
 }  // namespace port
 }  // namespace ROCKSDB_NAMESPACE
+
+#endif
