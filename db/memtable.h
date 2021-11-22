@@ -149,6 +149,7 @@ class MemTable {
   // used by MemTableListVersion::ApproximateMemoryUsageExcludingLast
   size_t ArenaBlockSize() const {
     return kArenaBlockSize;
+  }
   // Returns a vector of unique random memtable entries of size 'sample_size'.
   //
   // Note: the entries are stored in the unordered_set as length-prefixed keys,
