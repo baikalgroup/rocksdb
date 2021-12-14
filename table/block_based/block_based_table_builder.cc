@@ -910,8 +910,7 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
       r->first_key_in_next_block = &key;
       Flush();
       if (r->state == Rep::State::kBuffered) {
-        bool exceeds_buffer_limit =
-            (r->buffer_limit != 0 && r->data_begin_offset > r->buffer_limit);
+        bool exceeds_buffer_limit = r->data_begin_offset > r->buffer_limit;
         bool is_cache_full = false;
 
         // Increase cache reservation for the last buffered data block
