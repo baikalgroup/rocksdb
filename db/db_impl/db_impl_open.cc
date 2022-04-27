@@ -200,6 +200,13 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src,
                    "file size check will be skipped during open.");
   }
 
+  if (result.preserve_deletes) {
+    ROCKS_LOG_WARN(
+        result.info_log,
+        "preserve_deletes is deprecated, will be removed in a future release. "
+        "Please try using user-defined timestamp instead.");
+  }
+
   return result;
 }
 
@@ -857,6 +864,11 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
   bool flushed = false;
   uint64_t corrupted_wal_number = kMaxSequenceNumber;
   uint64_t min_wal_number = MinLogNumberToKeep();
+  if (!allow_2pc()) {
+    // In non-2pc mode, we skip WALs that do not back unflushed data.
+    min_wal_number =
+        std::max(min_wal_number, versions_->MinLogNumberWithUnflushedData());
+  }
   for (auto wal_number : wal_numbers) {
     if (wal_number < min_wal_number) {
       ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -1261,9 +1273,16 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
       }
 
       std::unique_ptr<VersionEdit> wal_deletion;
-      if (immutable_db_options_.track_and_verify_wals_in_manifest) {
-        wal_deletion.reset(new VersionEdit);
-        wal_deletion->DeleteWalsBefore(max_wal_number + 1);
+      if (flushed) {
+        wal_deletion = std::unique_ptr<VersionEdit>(new VersionEdit());
+        if (immutable_db_options_.track_and_verify_wals_in_manifest) {
+          wal_deletion->DeleteWalsBefore(max_wal_number + 1);
+        }
+        if (!allow_2pc()) {
+          // In non-2pc mode, flushing the memtables of the column families
+          // means we can advance min_log_number_to_keep.
+          wal_deletion->SetMinLogNumberToKeep(max_wal_number + 1);
+        }
         edit_lists.back().push_back(wal_deletion.get());
       }
 
@@ -1342,7 +1361,14 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
   // FindObsoleteFiles()
   total_log_size_ = 0;
   log_empty_ = false;
+  uint64_t min_wal_with_unflushed_data =
+      versions_->MinLogNumberWithUnflushedData();
   for (auto wal_number : wal_numbers) {
+    if (!allow_2pc() && wal_number < min_wal_with_unflushed_data) {
+      // In non-2pc mode, the WAL files not backing unflushed data are not
+      // alive, thus should not be added to the alive_log_files_.
+      continue;
+    }
     // We preallocate space for wals, but then after a crash and restart, those
     // preallocated space are not needed anymore. It is likely only the last
     // log has such preallocated space, so we only truncate for the last log.
@@ -1355,6 +1381,7 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
     total_log_size_ += log.size;
     alive_log_files_.push_back(log);
   }
+  alive_log_files_tail_ = alive_log_files_.rbegin();
   if (two_write_queues_) {
     log_write_mutex_.Unlock();
   }
@@ -1364,6 +1391,12 @@ Status DBImpl::RestoreAliveLogFiles(const std::vector<uint64_t>& wal_numbers) {
 Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
                                            MemTable* mem, VersionEdit* edit) {
   mutex_.AssertHeld();
+  assert(cfd);
+  assert(cfd->imm());
+  // The immutable memtable list must be empty.
+  assert(std::numeric_limits<uint64_t>::max() ==
+         cfd->imm()->GetEarliestMemTableID());
+
   const uint64_t start_micros = immutable_db_options_.clock->NowMicros();
 
   FileMetaData meta;
@@ -1458,12 +1491,13 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
   constexpr int level = 0;
 
   if (s.ok() && has_output) {
-    edit->AddFile(level, meta.fd.GetNumber(), meta.fd.GetPathId(),
-                  meta.fd.GetFileSize(), meta.smallest, meta.largest,
-                  meta.fd.smallest_seqno, meta.fd.largest_seqno,
-                  meta.marked_for_compaction, meta.oldest_blob_file_number,
-                  meta.oldest_ancester_time, meta.file_creation_time,
-                  meta.file_checksum, meta.file_checksum_func_name);
+    edit->AddFile(
+        level, meta.fd.GetNumber(), meta.fd.GetPathId(), meta.fd.GetFileSize(),
+        meta.smallest, meta.largest, meta.fd.smallest_seqno,
+        meta.fd.largest_seqno, meta.marked_for_compaction, meta.temperature,
+        meta.oldest_blob_file_number, meta.oldest_ancester_time,
+        meta.file_creation_time, meta.file_checksum,
+        meta.file_checksum_func_name, meta.min_timestamp, meta.max_timestamp);
 
     for (const auto& blob : blob_file_additions) {
       edit->AddBlobFile(blob);
@@ -1691,13 +1725,10 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
       impl->alive_log_files_.push_back(
           DBImpl::LogFileNumberSize(impl->logfile_number_));
+      impl->alive_log_files_tail_ = impl->alive_log_files_.rbegin();
       if (impl->two_write_queues_) {
         impl->log_write_mutex_.Unlock();
       }
-
-      impl->DeleteObsoleteFiles();
-      s = impl->directories_.GetDbDir()->Fsync(IOOptions(), nullptr);
-      TEST_SYNC_POINT("DBImpl::Open:AfterDeleteFilesAndSyncDir");
     }
     if (s.ok()) {
       // In WritePrepared there could be gap in sequence numbers. This breaks
@@ -1715,7 +1746,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         WriteOptions write_options;
         uint64_t log_used, log_size;
         log::Writer* log_writer = impl->logs_.back().writer;
-        s = impl->WriteToWAL(empty_batch, log_writer, &log_used, &log_size);
+        s = impl->WriteToWAL(empty_batch, log_writer, &log_used, &log_size,
+                             /*with_db_mutex==*/true);
         if (s.ok()) {
           // Need to fsync, otherwise it might get lost after a power reset.
           s = impl->FlushWAL(false);
@@ -1770,6 +1802,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
     *dbptr = impl;
     impl->opened_successfully_ = true;
+    impl->DeleteObsoleteFiles();
+    TEST_SYNC_POINT("DBImpl::Open:AfterDeleteFiles");
     impl->MaybeScheduleFlushOrCompaction();
   } else {
     persist_options_status.PermitUncheckedError();

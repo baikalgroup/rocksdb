@@ -197,7 +197,8 @@ class VersionStorageInfo {
   // Sort all files for this version based on their file size and
   // record results in files_by_compaction_pri_. The largest files are listed
   // first.
-  void UpdateFilesByCompactionPri(CompactionPri compaction_pri);
+  void UpdateFilesByCompactionPri(const ImmutableOptions& immutable_options,
+                                  const MutableCFOptions& mutable_cf_options);
 
   void GenerateLevel0NonOverlapping();
   bool level0_non_overlapping() const {
@@ -490,7 +491,7 @@ class VersionStorageInfo {
     next_file_to_compact_by_size_[level] = 0;
   }
 
-  const InternalKeyComparator* InternalComparator() {
+  const InternalKeyComparator* InternalComparator() const {
     return internal_comparator_;
   }
 
@@ -707,9 +708,11 @@ class Version {
   //    If the key has any merge operands then store them in
   //    merge_context.operands_list and don't merge the operands
   // REQUIRES: lock is not held
+  // REQUIRES: pinned_iters_mgr != nullptr
   void Get(const ReadOptions&, const LookupKey& key, PinnableSlice* value,
            std::string* timestamp, Status* status, MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
+           PinnedIteratorsManager* pinned_iters_mgr,
            bool* value_found = nullptr, bool* key_exists = nullptr,
            SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr,
            bool* is_blob = nullptr, bool do_merge = true);
@@ -722,13 +725,15 @@ class Version {
   // saves it in *value.
   // REQUIRES: blob_index_slice stores an encoded blob reference
   Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
-                 const Slice& blob_index_slice, PinnableSlice* value,
+                 const Slice& blob_index_slice,
+                 FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
   // Retrieves a blob using a blob reference and saves it in *value,
   // assuming the corresponding blob file is part of this Version.
   Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
-                 const BlobIndex& blob_index, PinnableSlice* value,
+                 const BlobIndex& blob_index,
+                 FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
   using BlobReadRequest =
@@ -803,6 +808,7 @@ class Version {
   int TEST_refs() const { return refs_; }
 
   VersionStorageInfo* storage_info() { return &storage_info_; }
+  const VersionStorageInfo* storage_info() const { return &storage_info_; }
 
   VersionSet* version_set() { return vset_; }
 
@@ -846,11 +852,6 @@ class Version {
   // Update the accumulated stats associated with the current version.
   // This accumulated stats will be used in compaction.
   void UpdateAccumulatedStats(bool update_stats);
-
-  // Sort all files for this version based on their file size and
-  // record results in files_by_compaction_pri_. The largest files are listed
-  // first.
-  void UpdateFilesByCompactionPri();
 
   ColumnFamilyData* cfd_;  // ColumnFamilyData to which this Version belongs
   Logger* info_log_;
@@ -1087,6 +1088,8 @@ class VersionSet {
 
 #endif  // ROCKSDB_LITE
 
+  const std::string& DbSessionId() const { return db_session_id_; }
+
   // Return the current manifest file number
   uint64_t manifest_file_number() const { return manifest_file_number_; }
 
@@ -1098,8 +1101,8 @@ class VersionSet {
 
   uint64_t current_next_file_number() const { return next_file_number_.load(); }
 
-  uint64_t min_log_number_to_keep_2pc() const {
-    return min_log_number_to_keep_2pc_.load();
+  uint64_t min_log_number_to_keep() const {
+    return min_log_number_to_keep_.load();
   }
 
   // Allocate and return a new file number
@@ -1157,7 +1160,7 @@ class VersionSet {
   // Mark the specified log number as deleted
   // REQUIRED: this is only called during single-threaded recovery or repair, or
   // from ::LogAndApply where the global mutex is held.
-  void MarkMinLogNumberToKeep2PC(uint64_t number);
+  void MarkMinLogNumberToKeep(uint64_t number);
 
   // Return the log file number for the log file that is currently
   // being compacted, or zero if there is no such log file.
@@ -1166,10 +1169,12 @@ class VersionSet {
   // Returns the minimum log number which still has data not flushed to any SST
   // file.
   // In non-2PC mode, all the log numbers smaller than this number can be safely
-  // deleted.
+  // deleted, although we still use `min_log_number_to_keep_` to determine when
+  // to delete a WAL file.
   uint64_t MinLogNumberWithUnflushedData() const {
     return PreComputeMinLogNumberWithUnflushedData(nullptr);
   }
+
   // Returns the minimum log number which still has data not flushed to any SST
   // file.
   // Empty column families' log number is considered to be
@@ -1267,6 +1272,10 @@ class VersionSet {
                         uint64_t min_pending_output);
 
   ColumnFamilySet* GetColumnFamilySet() { return column_family_set_.get(); }
+  RefedColumnFamilySet GetRefedColumnFamilySet() {
+    return RefedColumnFamilySet(GetColumnFamilySet());
+  }
+
   const FileOptions& file_options() { return file_options_; }
   void ChangeFileOptions(const MutableDBOptions& new_options) {
     file_options_.writable_file_max_buffer_size =
@@ -1369,9 +1378,8 @@ class VersionSet {
   const ImmutableDBOptions* const db_options_;
   std::atomic<uint64_t> next_file_number_;
   // Any WAL number smaller than this should be ignored during recovery,
-  // and is qualified for being deleted in 2PC mode. In non-2PC mode, this
-  // number is ignored.
-  std::atomic<uint64_t> min_log_number_to_keep_2pc_ = {0};
+  // and is qualified for being deleted.
+  std::atomic<uint64_t> min_log_number_to_keep_ = {0};
   uint64_t manifest_file_number_;
   uint64_t options_file_number_;
   uint64_t options_file_size_;
@@ -1380,6 +1388,9 @@ class VersionSet {
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.
   std::atomic<uint64_t> last_sequence_;
+  // The last sequence number of data committed to the descriptor (manifest
+  // file).
+  SequenceNumber descriptor_last_sequence_ = 0;
   // The last seq that is already allocated. It is applicable only when we have
   // two write queues. In that case seq might or might not have appreated in
   // memtable but it is expected to appear in the WAL.
@@ -1428,9 +1439,11 @@ class VersionSet {
                                bool new_descriptor_log,
                                const ColumnFamilyOptions* new_cf_options);
 
-  void LogAndApplyCFHelper(VersionEdit* edit);
+  void LogAndApplyCFHelper(VersionEdit* edit,
+                           SequenceNumber* max_last_sequence);
   Status LogAndApplyHelper(ColumnFamilyData* cfd, VersionBuilder* b,
-                           VersionEdit* edit, InstrumentedMutex* mu);
+                           VersionEdit* edit, SequenceNumber* max_last_sequence,
+                           InstrumentedMutex* mu);
 };
 
 // ReactiveVersionSet represents a collection of versions of the column

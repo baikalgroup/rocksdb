@@ -75,9 +75,14 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   if (my_batch == nullptr) {
     return Status::Corruption("Batch is nullptr!");
   }
+  // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
+  // grabs but does not seem thread-safe.
   if (tracer_) {
     InstrumentedMutexLock lock(&trace_mutex_);
-    if (tracer_) {
+    if (tracer_ && !tracer_->IsWriteOrderPreserved()) {
+      // We don't have to preserve write order so can trace anywhere. It's more
+      // efficient to trace here than to add latency to a phase of the log/apply
+      // pipeline.
       // TODO: maybe handle the tracing status?
       tracer_->Write(my_batch).PermitUncheckedError();
     }
@@ -156,11 +161,6 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         disable_memtable, batch_cnt, pre_release_callback);
-
-  if (!write_options.disableWAL) {
-    RecordTick(stats_, WRITE_WITH_WAL);
-  }
-
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
   write_thread_.JoinBatchGroup(&w);
@@ -254,6 +254,17 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   IOStatus io_s;
   Status pre_release_cb_status;
   if (status.ok()) {
+    // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
+    // grabs but does not seem thread-safe.
+    if (tracer_) {
+      InstrumentedMutexLock lock(&trace_mutex_);
+      if (tracer_ && tracer_->IsWriteOrderPreserved()) {
+        for (auto* writer : write_group) {
+          // TODO: maybe handle the tracing status?
+          tracer_->Write(writer->batch).PermitUncheckedError();
+        }
+      }
+    }
     // Rules for when we can update the memtable concurrently
     // 1. supported by memtable
     // 2. Puts are not okay if inplace_update_support
@@ -503,6 +514,17 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
     size_t total_byte_size = 0;
 
     if (w.status.ok()) {
+      // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
+      // grabs but does not seem thread-safe.
+      if (tracer_) {
+        InstrumentedMutexLock lock(&trace_mutex_);
+        if (tracer_ != nullptr && tracer_->IsWriteOrderPreserved()) {
+          for (auto* writer : wal_write_group) {
+            // TODO: maybe handle the tracing status?
+            tracer_->Write(writer->batch).PermitUncheckedError();
+          }
+        }
+      }
       SequenceNumber next_sequence = current_sequence;
       for (auto writer : wal_write_group) {
         if (writer->CheckCallback(this)) {
@@ -681,7 +703,6 @@ Status DBImpl::WriteImplWALOnly(
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         disable_memtable, sub_batch_cnt, pre_release_callback);
-  RecordTick(stats_, WRITE_WITH_WAL);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
   write_thread->JoinBatchGroup(&w);
@@ -728,6 +749,17 @@ Status DBImpl::WriteImplWALOnly(
   write_thread->EnterAsBatchGroupLeader(&w, &write_group);
   // Note: no need to update last_batch_group_size_ here since the batch writes
   // to WAL only
+  // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
+  // grabs but does not seem thread-safe.
+  if (tracer_) {
+    InstrumentedMutexLock lock(&trace_mutex_);
+    if (tracer_ != nullptr && tracer_->IsWriteOrderPreserved()) {
+      for (auto* writer : write_group) {
+        // TODO: maybe handle the tracing status?
+        tracer_->Write(writer->batch).PermitUncheckedError();
+      }
+    }
+  }
 
   size_t pre_release_callback_cnt = 0;
   size_t total_byte_size = 0;
@@ -1053,8 +1085,18 @@ WriteBatch* DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
 // write thread. Otherwise this must be called holding log_write_mutex_.
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             log::Writer* log_writer, uint64_t* log_used,
-                            uint64_t* log_size) {
+                            uint64_t* log_size,
+                            bool with_db_mutex, bool with_log_mutex) {
   assert(log_size != nullptr);
+
+  // Assert mutex explicitly.
+  if (with_db_mutex) {
+    mutex_.AssertHeld();
+  } else if (two_write_queues_) {
+    log_write_mutex_.AssertHeld();
+    assert(with_log_mutex);
+  }
+
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
   *log_size = log_entry.size();
   // When two_write_queues_ WriteToWAL has to be protected from concurretn calls
@@ -1077,9 +1119,12 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
     *log_used = logfile_number_;
   }
   total_log_size_ += log_entry.size();
-  // TODO(myabandeh): it might be unsafe to access alive_log_files_.back() here
-  // since alive_log_files_ might be modified concurrently
-  alive_log_files_.back().AddSize(log_entry.size());
+  if (with_db_mutex || with_log_mutex) {
+    assert(alive_log_files_tail_ == alive_log_files_.rbegin());
+    assert(alive_log_files_tail_ != alive_log_files_.rend());
+  }
+  LogFileNumberSize& last_alive_log = *alive_log_files_tail_;
+  last_alive_log.AddSize(*log_size);
   log_empty_ = false;
   return io_s;
 }
@@ -1089,6 +1134,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
                             bool need_log_sync, bool need_log_dir_sync,
                             SequenceNumber sequence) {
   IOStatus io_s;
+  assert(!two_write_queues_);
   assert(!write_group.leader->disable_wal);
   // Same holds for all in the batch group
   size_t write_with_wal = 0;
@@ -1148,7 +1194,9 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
       // We only sync WAL directory the first time WAL syncing is
       // requested, so that in case users never turn on WAL sync,
       // we can avoid the disk I/O in the write code path.
-      io_s = directories_.GetWalDir()->Fsync(IOOptions(), nullptr);
+      io_s = directories_.GetWalDir()->FsyncWithDirOptions(
+          IOOptions(), nullptr,
+          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
   }
 
@@ -1174,6 +1222,7 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
     SequenceNumber* last_sequence, size_t seq_inc) {
   IOStatus io_s;
 
+  assert(two_write_queues_ || immutable_db_options_.unordered_write);
   assert(!write_group.leader->disable_wal);
   // Same holds for all in the batch group
   WriteBatch tmp_batch;
@@ -1198,7 +1247,8 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
 
   log::Writer* log_writer = logs_.back().writer;
   uint64_t log_size;
-  io_s = WriteToWAL(*merged_batch, log_writer, log_used, &log_size);
+  io_s = WriteToWAL(*merged_batch, log_writer, log_used, &log_size,
+                    /*with_db_mutex=*/false, /*with_log_mutex=*/true);
   if (to_be_cached_state) {
     cached_recoverable_state_ = *to_be_cached_state;
     cached_recoverable_state_empty_ = false;
@@ -1664,8 +1714,8 @@ Status DBImpl::TrimMemtableHistory(WriteContext* context) {
   }
   for (auto& cfd : cfds) {
     autovector<MemTable*> to_delete;
-    bool trimmed = cfd->imm()->TrimHistory(
-        &context->memtables_to_free_, cfd->mem()->ApproximateMemoryUsage());
+    bool trimmed = cfd->imm()->TrimHistory(&context->memtables_to_free_,
+                                           cfd->mem()->MemoryAllocatedBytes());
     if (trimmed) {
       context->superversion_context.NewSuperVersion();
       assert(context->superversion_context.new_superversion.get() != nullptr);
@@ -1852,6 +1902,7 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
       log_dir_synced_ = false;
       logs_.emplace_back(logfile_number_, new_log);
       alive_log_files_.push_back(LogFileNumberSize(logfile_number_));
+      alive_log_files_tail_ = alive_log_files_.rbegin();
     }
     log_write_mutex_.Unlock();
   }

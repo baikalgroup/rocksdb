@@ -274,6 +274,9 @@ class TestFlushListener : public EventListener {
     ASSERT_TRUE(test_);
     if (db == test_->db_) {
       std::vector<std::vector<FileMetaData>> files_by_level;
+      ASSERT_LT(info.cf_id, test_->handles_.size());
+      ASSERT_GE(info.cf_id, 0u);
+      ASSERT_NE(test_->handles_[info.cf_id], nullptr);
       test_->dbfull()->TEST_GetFilesMetaData(test_->handles_[info.cf_id],
                                              &files_by_level);
 
@@ -377,6 +380,7 @@ TEST_F(EventListenerTest, MultiCF) {
     ASSERT_OK(Put(7, "popovich", std::string(90000, 'p')));
     for (int i = 1; i < 8; ++i) {
       ASSERT_OK(Flush(i));
+      ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
       ASSERT_EQ(listener->flushed_dbs_.size(), i);
       ASSERT_EQ(listener->flushed_column_family_names_.size(), i);
     }
@@ -511,6 +515,9 @@ TEST_F(EventListenerTest, DisableBGCompaction) {
     db_->GetColumnFamilyMetaData(handles_[1], &cf_meta);
   }
   ASSERT_GE(listener->slowdown_count, kSlowdownTrigger * 9);
+  // We don't want the listener executing during DBTestBase::Close() due to
+  // race on handles_.
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
 }
 
 class TestCompactionReasonListener : public EventListener {
@@ -686,6 +693,8 @@ class TableFileCreationListener : public EventListener {
   class TestEnv : public EnvWrapper {
    public:
     explicit TestEnv(Env* t) : EnvWrapper(t) {}
+    static const char* kClassName() { return "TestEnv"; }
+    const char* Name() const override { return kClassName(); }
 
     void SetStatus(Status s) { status_ = s; }
 
@@ -771,6 +780,7 @@ class TableFileCreationListener : public EventListener {
     } else {
       if (idx >= 0) {
         failure_[idx]++;
+        last_failure_ = info.status;
       }
     }
   }
@@ -778,6 +788,7 @@ class TableFileCreationListener : public EventListener {
   int started_[2];
   int finished_[2];
   int failure_[2];
+  Status last_failure_;
 };
 
 TEST_F(EventListenerTest, TableFileCreationListenersTest) {
@@ -800,6 +811,7 @@ TEST_F(EventListenerTest, TableFileCreationListenersTest) {
   test_env->SetStatus(Status::NotSupported("not supported"));
   ASSERT_NOK(Flush());
   listener->CheckAndResetCounters(1, 1, 1, 0, 0, 0);
+  ASSERT_TRUE(listener->last_failure_.IsNotSupported());
   test_env->SetStatus(Status::OK());
 
   Reopen(options);
@@ -816,6 +828,14 @@ TEST_F(EventListenerTest, TableFileCreationListenersTest) {
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
   listener->CheckAndResetCounters(0, 0, 0, 1, 1, 0);
 
+  // Verify that an empty table file that is immediately deleted gives Aborted
+  // status to listener.
+  ASSERT_OK(Put("baz", "z"));
+  ASSERT_OK(SingleDelete("baz"));
+  ASSERT_OK(Flush());
+  listener->CheckAndResetCounters(1, 1, 1, 0, 0, 0);
+  ASSERT_TRUE(listener->last_failure_.IsAborted());
+
   ASSERT_OK(Put("foo", "aaa3"));
   ASSERT_OK(Put("bar", "bbb3"));
   ASSERT_OK(Flush());
@@ -824,6 +844,7 @@ TEST_F(EventListenerTest, TableFileCreationListenersTest) {
       dbfull()->CompactRange(CompactRangeOptions(), &kRangeStart, &kRangeEnd));
   ASSERT_NOK(dbfull()->TEST_WaitForCompact());
   listener->CheckAndResetCounters(1, 1, 0, 1, 1, 1);
+  ASSERT_TRUE(listener->last_failure_.IsNotSupported());
   Close();
 }
 
@@ -1233,7 +1254,7 @@ class BlobDBJobLevelEventListenerTest : public EventListener {
   }
 
   const VersionStorageInfo::BlobFiles& GetBlobFiles() {
-    VersionSet* const versions = test_->dbfull()->TEST_GetVersionSet();
+    VersionSet* const versions = test_->dbfull()->GetVersionSet();
     assert(versions);
 
     ColumnFamilyData* const cfd = versions->GetColumnFamilySet()->GetDefault();
@@ -1535,6 +1556,7 @@ TEST_F(EventListenerTest, BlobDBFileTest) {
   // On compaction, because of blob_garbage_collection_age_cutoff, it will
   // delete the oldest blob file and create new blob file during compaction.
   ASSERT_OK(db_->CompactRange(CompactRangeOptions(), begin, end));
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
 
   blob_event_listener->CheckCounters();
 }

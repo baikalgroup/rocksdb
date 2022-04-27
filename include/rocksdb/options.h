@@ -396,6 +396,9 @@ struct CompactionServiceJobInfo {
         priority(priority_) {}
 };
 
+// Exceptions MUST NOT propagate out of overridden functions into RocksDB,
+// because RocksDB is not exception-safe. This could cause undefined behavior
+// including data loss, unreported corruption, deadlocks, and more.
 class CompactionService : public Customizable {
  public:
   static const char* Type() { return "CompactionService"; }
@@ -510,7 +513,7 @@ struct DBOptions {
   // Default: Env::Default()
   Env* env = Env::Default();
 
-  // Use to control write rate of flush and compaction. Flush has higher
+  // Use to control write/read rate of flush and compaction. Flush has higher
   // priority than compaction. Rate limiting is disabled if nullptr.
   // If rate limiter is enabled, bytes_per_sync is set to 1MB by default.
   // Default: nullptr
@@ -565,8 +568,18 @@ struct DBOptions {
   // (i.e. the ones that are causing all the space amplification). If set to 0
   // (default), we will dynamically choose the WAL size limit to be
   // [sum of all write_buffer_size * max_write_buffer_number] * 4
-  // This option takes effect only when there are more than one column family as
-  // otherwise the wal size is dictated by the write_buffer_size.
+  //
+  // For example, with 15 column families, each with
+  // write_buffer_size = 128 MB
+  // max_write_buffer_number = 6
+  // max_total_wal_size will be calculated to be [15 * 128MB * 6] * 4 = 45GB
+  //
+  // The RocksDB wiki has some discussion about how the WAL interacts
+  // with memtables and flushing of column families.
+  // https://github.com/facebook/rocksdb/wiki/Column-Families
+  //
+  // This option takes effect only when there are more than one column
+  // family as otherwise the wal size is dictated by the write_buffer_size.
   //
   // Default: 0
   //
@@ -650,7 +663,7 @@ struct DBOptions {
   // Dynamically changeable through SetDBOptions() API.
   int base_background_compactions = -1;
 
-  // NOT SUPPORTED ANYMORE: RocksDB automatically decides this based on the
+  // DEPRECATED: RocksDB automatically decides this based on the
   // value of max_background_jobs. For backwards compatibility we will set
   // `max_background_jobs = max_background_compactions + max_background_flushes`
   // in the case where user sets at least one of `max_background_compactions` or
@@ -676,7 +689,7 @@ struct DBOptions {
   // Dynamically changeable through SetDBOptions() API.
   uint32_t max_subcompactions = 1;
 
-  // NOT SUPPORTED ANYMORE: RocksDB automatically decides this based on the
+  // DEPRECATED: RocksDB automatically decides this based on the
   // value of max_background_jobs. For backwards compatibility we will set
   // `max_background_jobs = max_background_compactions + max_background_flushes`
   // in the case where user sets at least one of `max_background_compactions` or
@@ -759,7 +772,9 @@ struct DBOptions {
   // large amounts of data (such as xfs's allocsize option).
   size_t manifest_preallocation_size = 4 * 1024 * 1024;
 
-  // Allow the OS to mmap file for reading sst tables. Default: false
+  // Allow the OS to mmap file for reading sst tables.
+  // Not recommended for 32-bit OS.
+  // Default: false
   bool allow_mmap_reads = false;
 
   // Allow the OS to mmap file for writing.
@@ -931,7 +946,7 @@ struct DBOptions {
   size_t random_access_max_buffer_size = 1024 * 1024;
 
   // This is the maximum buffer size that is used by WritableFileWriter.
-  // On Windows, we need to maintain an aligned buffer for writes.
+  // With direct IO, we need to maintain an aligned buffer for writes.
   // We allow the buffer to grow until it's size hits the limit in buffered
   // IO and fix the buffer size when using direct IO to ensure alignment of
   // write requests if the logical sector size is unusual
@@ -1196,16 +1211,9 @@ struct DBOptions {
   // Immutable.
   bool allow_ingest_behind = false;
 
-  // Needed to support differential snapshots.
-  // If set to true then DB will only process deletes with sequence number
-  // less than what was set by SetPreserveDeletesSequenceNumber(uint64_t ts).
-  // Clients are responsible to periodically call this method to advance
-  // the cutoff time. If this method is never called and preserve_deletes
-  // is set to true NO deletes will ever be processed.
-  // At the moment this only keeps normal deletes, SingleDeletes will
-  // not be preserved.
+  // Deprecated, will be removed in a future release.
+  // Please try using user-defined timestamp instead.
   // DEFAULT: false
-  // Immutable (TODO: make it dynamically changeable)
   bool preserve_deletes = false;
 
   // If enabled it uses two queues for writes, one for the ones with
@@ -1359,7 +1367,11 @@ struct Options : public DBOptions, public ColumnFamilyOptions {
           const ColumnFamilyOptions& column_family_options)
       : DBOptions(db_options), ColumnFamilyOptions(column_family_options) {}
 
-  // The function recovers options to the option as in version 4.6.
+  // Change to some default settings from an older version.
+  // NOT MAINTAINED: This function has not been and is not maintained.
+  // DEPRECATED: This function might be removed in a future release.
+  // In general, defaults are changed to suit broad interests. Opting
+  // out of a change on upgrade should be deliberate and considered.
   Options* OldDefaults(int rocksdb_major_version = 4,
                        int rocksdb_minor_version = 6);
 
@@ -1382,6 +1394,12 @@ struct Options : public DBOptions, public ColumnFamilyOptions {
   // Use this if your DB is very small (like under 1GB) and you don't want to
   // spend lots of memory for memtables.
   Options* OptimizeForSmallDb();
+
+  // Disable some checks that should not be necessary in the absence of
+  // software logic errors or CPU+memory hardware errors. This can improve
+  // write speeds but is only recommended for temporary use. Does not
+  // change protection against corrupt storage (e.g. verify_checksums).
+  Options* DisableExtraChecks();
 };
 
 //
@@ -1544,10 +1562,8 @@ struct ReadOptions {
   // Default: empty (every table will be scanned)
   std::function<bool(const TableProperties&)> table_filter;
 
-  // Needed to support differential snapshots. Has 2 effects:
-  // 1) Iterator will skip all internal keys with seqnum < iter_start_seqnum
-  // 2) if this param > 0 iterator will return INTERNAL keys instead of
-  //    user keys; e.g. return tombstones as well.
+  // Deprecated, will be removed in a future release.
+  // Please try using user-defined timestamp instead.
   // Default: 0 (don't filter by seqnum, return user keys)
   SequenceNumber iter_start_seqnum;
 
@@ -1588,6 +1604,19 @@ struct ReadOptions {
   //
   // Default: std::numeric_limits<uint64_t>::max()
   uint64_t value_size_soft_limit;
+
+  // For iterators, RocksDB does auto-readahead on noticing more than two
+  // sequential reads for a table file if user doesn't provide readahead_size.
+  // The readahead starts at 8KB and doubles on every additional read upto
+  // max_auto_readahead_size only when reads are sequential. However at each
+  // level, if iterator moves over next file, readahead_size starts again from
+  // 8KB.
+  //
+  // By enabling this option, RocksDB will do some enhancements for
+  // prefetching the data.
+  //
+  // Default: false
+  bool adaptive_readahead;
 
   ReadOptions();
   ReadOptions(bool cksum, bool cache);
@@ -1834,7 +1863,13 @@ enum TraceFilterType : uint64_t {
   // Do not trace the get operations
   kTraceFilterGet = 0x1 << 0,
   // Do not trace the write operations
-  kTraceFilterWrite = 0x1 << 1
+  kTraceFilterWrite = 0x1 << 1,
+  // Do not trace the `Iterator::Seek()` operations
+  kTraceFilterIteratorSeek = 0x1 << 2,
+  // Do not trace the `Iterator::SeekForPrev()` operations
+  kTraceFilterIteratorSeekForPrev = 0x1 << 3,
+  // Do not trace the `MultiGet()` operations
+  kTraceFilterMultiGet = 0x1 << 4,
 };
 
 // TraceOptions is used for StartTrace
@@ -1847,6 +1882,13 @@ struct TraceOptions {
   uint64_t sampling_frequency = 1;
   // Note: The filtering happens before sampling.
   uint64_t filter = kTraceFilterNone;
+  // When true, the order of write records in the trace will match the order of
+  // the corresponding write records in the WAL and applied to the DB. There may
+  // be a performance penalty associated with preserving this ordering.
+  //
+  // Default: false. This means write records in the trace may be in an order
+  // different from the WAL's order.
+  bool preserve_write_order = false;
 };
 
 // ImportColumnFamilyOptions is used by ImportColumnFamily()

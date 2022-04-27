@@ -141,7 +141,9 @@ class PosixFileSystem : public FileSystem {
  public:
   PosixFileSystem();
 
-  const char* Name() const override { return "Posix File System"; }
+  static const char* kClassName() { return "PosixFileSystem"; }
+  const char* Name() const override { return kClassName(); }
+  const char* NickName() const override { return kDefaultName(); }
 
   ~PosixFileSystem() override {}
 
@@ -236,7 +238,7 @@ class PosixFileSystem : public FileSystem {
     }
     SetFD_CLOEXEC(fd, &options);
 
-    if (options.use_mmap_reads && sizeof(void*) >= 8) {
+    if (options.use_mmap_reads) {
       // Use of mmap for random reads has been removed because it
       // kills performance when storage is fast.
       // Use mmap when virtual address-space is plentiful.
@@ -323,14 +325,7 @@ class PosixFileSystem : public FileSystem {
     SetFD_CLOEXEC(fd, &options);
 
     if (options.use_mmap_writes) {
-      if (!checkedDiskForMmap_) {
-        // this will be executed once in the program's lifetime.
-        // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
-        if (!SupportsFastAllocate(fname)) {
-          forceMmapOff_ = true;
-        }
-        checkedDiskForMmap_ = true;
-      }
+      MaybeForceDisableMmap(fd);
     }
     if (options.use_mmap_writes && !forceMmapOff_) {
       result->reset(new PosixMmapFile(fname, fd, page_size_, options));
@@ -429,14 +424,7 @@ class PosixFileSystem : public FileSystem {
     }
 
     if (options.use_mmap_writes) {
-      if (!checkedDiskForMmap_) {
-        // this will be executed once in the program's lifetime.
-        // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
-        if (!SupportsFastAllocate(fname)) {
-          forceMmapOff_ = true;
-        }
-        checkedDiskForMmap_ = true;
-      }
+      MaybeForceDisableMmap(fd);
     }
     if (options.use_mmap_writes && !forceMmapOff_) {
       result->reset(new PosixMmapFile(fname, fd, page_size_, options));
@@ -618,7 +606,8 @@ class PosixFileSystem : public FileSystem {
         return IOStatus::NotFound();
       default:
         assert(err == EIO || err == ENOMEM);
-        return IOStatus::IOError("Unexpected error(" + ToString(err) +
+        return IOStatus::IOError("Unexpected error(" +
+                                 ROCKSDB_NAMESPACE::ToString(err) +
                                  ") accessing file `" + fname + "' ");
     }
   }
@@ -750,8 +739,10 @@ class PosixFileSystem : public FileSystem {
                     const IOOptions& /*opts*/,
                     IODebugContext* /*dbg*/) override {
     if (link(src.c_str(), target.c_str()) != 0) {
-      if (errno == EXDEV) {
-        return IOStatus::NotSupported("No cross FS links allowed");
+      if (errno == EXDEV || errno == ENOTSUP) {
+        return IOStatus::NotSupported(errno == EXDEV
+                                          ? "No cross FS links allowed"
+                                          : "Links not supported by FS");
       }
       return IOError("while link file to " + target, src, errno);
     }
@@ -819,11 +810,12 @@ class PosixFileSystem : public FileSystem {
       errno = ENOLCK;
       // Note that the thread ID printed is the same one as the one in
       // posix logger, but posix logger prints it hex format.
-      return IOError("lock hold by current process, acquire time " +
-                         ToString(prev_info.acquire_time) +
-                         " acquiring thread " +
-                         ToString(prev_info.acquiring_thread),
-                     fname, errno);
+      return IOError(
+          "lock hold by current process, acquire time " +
+              ROCKSDB_NAMESPACE::ToString(prev_info.acquire_time) +
+              " acquiring thread " +
+              ROCKSDB_NAMESPACE::ToString(prev_info.acquiring_thread),
+          fname, errno);
     }
 
     IOStatus result = IOStatus::OK();
@@ -993,8 +985,7 @@ class PosixFileSystem : public FileSystem {
   }
 #endif
  private:
-  bool checkedDiskForMmap_;
-  bool forceMmapOff_;  // do we override Env options?
+  bool forceMmapOff_ = false;  // do we override Env options?
 
   // Returns true iff the named directory exists and is a directory.
   virtual bool DirExists(const std::string& dname) {
@@ -1005,10 +996,10 @@ class PosixFileSystem : public FileSystem {
     return false;  // stat() failed return false
   }
 
-  bool SupportsFastAllocate(const std::string& path) {
+  bool SupportsFastAllocate(int fd) {
 #ifdef ROCKSDB_FALLOCATE_PRESENT
     struct statfs s;
-    if (statfs(path.c_str(), &s)) {
+    if (fstatfs(fd, &s)) {
       return false;
     }
     switch (s.f_type) {
@@ -1022,9 +1013,24 @@ class PosixFileSystem : public FileSystem {
         return false;
     }
 #else
-    (void)path;
+    (void)fd;
     return false;
 #endif
+  }
+
+  void MaybeForceDisableMmap(int fd) {
+    static std::once_flag s_check_disk_for_mmap_once;
+    assert(this == FileSystem::Default().get());
+    std::call_once(
+        s_check_disk_for_mmap_once,
+        [this](int fdesc) {
+          // this will be executed once in the program's lifetime.
+          // do not use mmapWrite on non ext-3/xfs/tmpfs systems.
+          if (!SupportsFastAllocate(fdesc)) {
+            forceMmapOff_ = true;
+          }
+        },
+        fd);
   }
 
 #ifdef ROCKSDB_IOURING_PRESENT
@@ -1090,8 +1096,7 @@ size_t PosixFileSystem::GetLogicalBlockSizeForWriteIfNeeded(
 }
 
 PosixFileSystem::PosixFileSystem()
-    : checkedDiskForMmap_(false),
-      forceMmapOff_(false),
+    : forceMmapOff_(false),
       page_size_(getpagesize()),
       allow_non_owner_access_(true) {
 #if defined(ROCKSDB_IOURING_PRESENT)
@@ -1120,8 +1125,8 @@ std::shared_ptr<FileSystem> FileSystem::Default() {
 
 #ifndef ROCKSDB_LITE
 static FactoryFunc<FileSystem> posix_filesystem_reg =
-    ObjectLibrary::Default()->Register<FileSystem>(
-        "posix://.*",
+    ObjectLibrary::Default()->AddFactory<FileSystem>(
+        ObjectLibrary::PatternEntry("posix").AddSeparator("://", false),
         [](const std::string& /* uri */, std::unique_ptr<FileSystem>* f,
            std::string* /* errmsg */) {
           f->reset(new PosixFileSystem());

@@ -355,6 +355,16 @@ class DBImpl : public DB {
 
   virtual bool SetPreserveDeletesSequenceNumber(SequenceNumber seqnum) override;
 
+  // IncreaseFullHistoryTsLow(ColumnFamilyHandle*, std::string) will acquire
+  // and release db_mutex
+  Status IncreaseFullHistoryTsLow(ColumnFamilyHandle* column_family,
+                                  std::string ts_low) override;
+
+  // GetFullHistoryTsLow(ColumnFamilyHandle*, std::string*) will acquire and
+  // release db_mutex
+  Status GetFullHistoryTsLow(ColumnFamilyHandle* column_family,
+                             std::string* ts_low) override;
+
   virtual Status GetDbIdentity(std::string& identity) const override;
 
   virtual Status GetDbIdentityFromIdentityFile(std::string* identity) const;
@@ -582,9 +592,15 @@ class DBImpl : public DB {
   // in the memtables, including memtable history.  If cache_only is false,
   // SST files will also be checked.
   //
+  // `key` should NOT have user-defined timestamp appended to user key even if
+  // timestamp is enabled.
+  //
   // If a key is found, *found_record_for_key will be set to true and
   // *seq will be set to the stored sequence number for the latest
-  // operation on this key or kMaxSequenceNumber if unknown.
+  // operation on this key or kMaxSequenceNumber if unknown. If user-defined
+  // timestamp is enabled for this column family and timestamp is not nullptr,
+  // then *timestamp will be set to the stored timestamp for the latest
+  // operation on this key.
   // If no key is found, *found_record_for_key will be set to false.
   //
   // Note: If cache_only=false, it is possible for *seq to be set to 0 if
@@ -608,9 +624,9 @@ class DBImpl : public DB {
   Status GetLatestSequenceForKey(SuperVersion* sv, const Slice& key,
                                  bool cache_only,
                                  SequenceNumber lower_bound_seq,
-                                 SequenceNumber* seq,
+                                 SequenceNumber* seq, std::string* timestamp,
                                  bool* found_record_for_key,
-                                 bool* is_blob_index = nullptr);
+                                 bool* is_blob_index);
 
   Status TraceIteratorSeek(const uint32_t& cf_id, const Slice& key,
                            const Slice& lower_bound, const Slice upper_bound);
@@ -936,6 +952,8 @@ class DBImpl : public DB {
                                      int max_entries_to_print,
                                      std::string* out_str);
 
+  VersionSet* GetVersionSet() const { return versions_.get(); }
+
 #ifndef NDEBUG
   // Compact any files in the named level that overlap [*begin, *end]
   Status TEST_CompactRange(int level, const Slice* begin, const Slice* end,
@@ -966,6 +984,9 @@ class DBImpl : public DB {
   Status TEST_AtomicFlushMemTables(const autovector<ColumnFamilyData*>& cfds,
                                    const FlushOptions& flush_opts);
 
+  // Wait for background threads to complete scheduled work.
+  Status TEST_WaitForBackgroundWork();
+
   // Wait for memtable compaction
   Status TEST_WaitForFlushMemTable(ColumnFamilyHandle* column_family = nullptr);
 
@@ -973,6 +994,9 @@ class DBImpl : public DB {
   // We add a bool parameter to wait for unscheduledCompactions_ == 0, but this
   // is only for the special test of CancelledCompactions
   Status TEST_WaitForCompact(bool waitUnscheduled = false);
+
+  // Wait for any background purge
+  Status TEST_WaitForPurge();
 
   // Get the background error status
   Status TEST_GetBGError();
@@ -1039,8 +1063,6 @@ class DBImpl : public DB {
   size_t TEST_GetWalPreallocateBlockSize(uint64_t write_buffer_size) const;
   void TEST_WaitForStatsDumpRun(std::function<void()> callback) const;
   size_t TEST_EstimateInMemoryStatsHistorySize() const;
-
-  VersionSet* TEST_GetVersionSet() const { return versions_.get(); }
 
   uint64_t TEST_GetCurrentLogNumber() const {
     InstrumentedMutexLock l(mutex());
@@ -1119,10 +1141,12 @@ class DBImpl : public DB {
     State state_;
   };
 
+  static void TEST_ResetDbSessionIdGen();
   static std::string GenerateDbSessionId(Env* env);
 
  protected:
   const std::string dbname_;
+  // TODO(peterd): unify with VersionSet::db_id_
   std::string db_id_;
   // db_session_id_ is an identifier that gets reset
   // every time the DB is opened
@@ -1468,19 +1492,31 @@ class DBImpl : public DB {
 
   // Information for a manual compaction
   struct ManualCompactionState {
+    ManualCompactionState(ColumnFamilyData* _cfd, int _input_level,
+                          int _output_level, uint32_t _output_path_id,
+                          bool _exclusive, bool _disallow_trivial_move,
+                          std::atomic<bool>* _canceled)
+        : cfd(_cfd),
+          input_level(_input_level),
+          output_level(_output_level),
+          output_path_id(_output_path_id),
+          exclusive(_exclusive),
+          disallow_trivial_move(_disallow_trivial_move),
+          canceled(_canceled) {}
+
     ColumnFamilyData* cfd;
     int input_level;
     int output_level;
     uint32_t output_path_id;
     Status status;
-    bool done;
-    bool in_progress;             // compaction request being processed?
-    bool incomplete;              // only part of requested range compacted
-    bool exclusive;               // current behavior of only one manual
-    bool disallow_trivial_move;   // Force actual compaction to run
-    const InternalKey* begin;     // nullptr means beginning of key range
-    const InternalKey* end;       // nullptr means end of key range
-    InternalKey* manual_end;      // how far we are compacting
+    bool done = false;
+    bool in_progress = false;    // compaction request being processed?
+    bool incomplete = false;     // only part of requested range compacted
+    bool exclusive;              // current behavior of only one manual
+    bool disallow_trivial_move;  // Force actual compaction to run
+    const InternalKey* begin = nullptr;  // nullptr means beginning of key range
+    const InternalKey* end = nullptr;    // nullptr means end of key range
+    InternalKey* manual_end = nullptr;   // how far we are compacting
     InternalKey tmp_storage;      // Used to keep track of compaction progress
     InternalKey tmp_storage1;     // Used to keep track of compaction progress
     std::atomic<bool>* canceled;  // Compaction canceled by the user?
@@ -1687,6 +1723,25 @@ class DBImpl : public DB {
     }
   }
 
+  // TaskType is used to identify tasks in thread-pool, currently only
+  // differentiate manual compaction, which could be unscheduled from the
+  // thread-pool.
+  enum class TaskType : uint8_t {
+    kDefault = 0,
+    kManualCompaction = 1,
+    kCount = 2,
+  };
+
+  // Task tag is used to identity tasks in thread-pool, which is
+  // dbImpl obj address + type
+  inline void* GetTaskTag(TaskType type) {
+    return GetTaskTag(static_cast<uint8_t>(type));
+  }
+
+  inline void* GetTaskTag(uint8_t type) {
+    return static_cast<uint8_t*>(static_cast<void*>(this)) + type;
+  }
+
   // REQUIRES: mutex locked and in write thread.
   void AssignAtomicFlushSeq(const autovector<ColumnFamilyData*>& cfds);
 
@@ -1705,7 +1760,8 @@ class DBImpl : public DB {
                          WriteBatch** to_be_cached_state);
 
   IOStatus WriteToWAL(const WriteBatch& merged_batch, log::Writer* log_writer,
-                      uint64_t* log_used, uint64_t* log_size);
+                      uint64_t* log_used, uint64_t* log_size,
+                      bool with_db_mutex = false, bool with_log_mutex = false);
 
   IOStatus WriteToWAL(const WriteThread::WriteGroup& write_group,
                       log::Writer* log_writer, uint64_t* log_used,
@@ -1973,7 +2029,8 @@ class DBImpl : public DB {
 
   Status DisableFileDeletionsWithLock();
 
-  Status IncreaseFullHistoryTsLow(ColumnFamilyData* cfd, std::string ts_low);
+  Status IncreaseFullHistoryTsLowImpl(ColumnFamilyData* cfd,
+                                      std::string ts_low);
 
   // Lock over the persistent DB state.  Non-nullptr iff successfully acquired.
   FileLock* db_lock_;
@@ -2030,12 +2087,15 @@ class DBImpl : public DB {
   bool persistent_stats_cfd_exists_ = true;
 
   // Without two_write_queues, read and writes to alive_log_files_ are
-  // protected by mutex_. However since back() is never popped, and push_back()
-  // is done only from write_thread_, the same thread can access the item
-  // reffered by back() without mutex_. With two_write_queues_, writes
+  // protected by mutex_. With two_write_queues_, writes
   // are protected by locking both mutex_ and log_write_mutex_, and reads must
   // be under either mutex_ or log_write_mutex_.
   std::deque<LogFileNumberSize> alive_log_files_;
+  // Caching the result of `alive_log_files_.back()` so that we do not have to
+  // call `alive_log_files_.back()` in the write thread (WriteToWAL()) which
+  // requires locking db mutex if log_mutex_ is not already held in
+  // two-write-queues mode.
+  std::deque<LogFileNumberSize>::reverse_iterator alive_log_files_tail_;
   // Log files that aren't fully synced, and the current log file.
   // Synchronization:
   //  - push_back() is done from write_thread_ with locked mutex_ and
@@ -2312,6 +2372,10 @@ class DBImpl : public DB {
 
   // Pointer to WriteBufferManager stalling interface.
   std::unique_ptr<StallInterface> wbm_stall_;
+
+  // Indicate if deprecation warning message is logged before. Will be removed
+  // soon with the deprecated feature.
+  std::atomic_bool iter_start_seqnum_deprecation_warned_{false};
 };
 
 extern Options SanitizeOptions(const std::string& db, const Options& src,
@@ -2356,11 +2420,10 @@ extern uint64_t PrecomputeMinLogNumberToKeepNon2PC(
 // will not depend on any WAL file. nullptr means no memtable is being flushed.
 // The function is only applicable to 2pc mode.
 extern uint64_t FindMinPrepLogReferencedByMemTable(
-    VersionSet* vset, const ColumnFamilyData* cfd_to_flush,
-    const autovector<MemTable*>& memtables_to_flush);
+    VersionSet* vset, const autovector<MemTable*>& memtables_to_flush);
 // For atomic flush.
 extern uint64_t FindMinPrepLogReferencedByMemTable(
-    VersionSet* vset, const autovector<ColumnFamilyData*>& cfds_to_flush,
+    VersionSet* vset,
     const autovector<const autovector<MemTable*>*>& memtables_to_flush);
 
 // Fix user-supplied options to be reasonable

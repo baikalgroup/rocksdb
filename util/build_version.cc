@@ -9,7 +9,15 @@
 // on whether or not GIT is available and the platform settings
 static const std::string rocksdb_build_git_sha  = "rocksdb_build_git_sha:@GIT_SHA@";
 static const std::string rocksdb_build_git_tag = "rocksdb_build_git_tag:@GIT_TAG@";
+#if HAS_GIT_CHANGES == 0
+// If HAS_GIT_CHANGES is 0, the GIT date is used.
+// Use the time the branch/tag was last modified
 static const std::string rocksdb_build_date = "rocksdb_build_date:@GIT_DATE@";
+#else
+// If HAS_GIT_CHANGES is > 0, the branch/tag has modifications.
+// Use the time the build was created.
+static const std::string rocksdb_build_date = "rocksdb_build_date:@BUILD_DATE@";
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 static void AddProperty(std::unordered_map<std::string, std::string> *props, const std::string& name) {

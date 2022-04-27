@@ -47,6 +47,7 @@ CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@git_tag")
 LIB_SOURCES="""
   cache/cache.cc
   cache/cache_entry_roles.cc
+  cache/cache_key.cc
   cache/cache_reservation_manager.cc
   cache/clock_cache.cc                                          \
   cache/lru_cache.cc                                            \
@@ -63,6 +64,7 @@ LIB_SOURCES="""
   db/blob/blob_log_format.cc
   db/blob/blob_log_sequential_reader.cc
   db/blob/blob_log_writer.cc
+  db/blob/prefetch_buffer_collection.cc
   db/builder.cc                                                 \
   db/c.cc                                                       \
   db/column_family.cc                                           \
@@ -157,6 +159,7 @@ LIB_SOURCES="""
   memory/concurrent_arena.cc
   memory/jemalloc_nodump_allocator.cc
   memory/memkind_kmem_allocator.cc
+  memory/memory_allocator.cc
   memtable/alloc_tracker.cc                                     \
   memtable/hash_linklist_rep.cc                                 \
   memtable/hash_skiplist_rep.cc                                 \
@@ -288,6 +291,7 @@ LIB_SOURCES="""
   utilities/env_timed.cc                                        \
   utilities/fault_injection_env.cc
   utilities/fault_injection_fs.cc
+  utilities/fault_injection_secondary_cache.cc
   utilities/leveldb_options/leveldb_options.cc                  \
   utilities/memory/memory_util.cc                               \
   utilities/merge_operators.cc

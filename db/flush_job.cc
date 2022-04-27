@@ -351,7 +351,7 @@ Status FlushJob::MemPurge() {
 
   // Measure purging time.
   const uint64_t start_micros = clock_->NowMicros();
-  const uint64_t start_cpu_micros = clock_->CPUNanos() / 1000;
+  const uint64_t start_cpu_micros = clock_->CPUMicros();
 
   MemTable* new_mem = nullptr;
   // For performance/log investigation purposes:
@@ -603,7 +603,7 @@ Status FlushJob::MemPurge() {
     TEST_SYNC_POINT("DBImpl::FlushJob:MemPurgeUnsuccessful");
   }
   const uint64_t micros = clock_->NowMicros() - start_micros;
-  const uint64_t cpu_micros = clock_->CPUNanos() / 1000 - start_cpu_micros;
+  const uint64_t cpu_micros = clock_->CPUMicros() - start_cpu_micros;
   ROCKS_LOG_INFO(db_options_.info_log,
                  "[%s] [JOB %d] Mempurge lasted %" PRIu64
                  " microseconds, and %" PRIu64
@@ -789,7 +789,7 @@ Status FlushJob::WriteLevel0Table() {
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
   db_mutex_->AssertHeld();
   const uint64_t start_micros = clock_->NowMicros();
-  const uint64_t start_cpu_micros = clock_->CPUNanos() / 1000;
+  const uint64_t start_cpu_micros = clock_->CPUMicros();
   Status s;
 
   std::vector<BlobFileAddition> blob_file_additions;
@@ -937,7 +937,9 @@ Status FlushJob::WriteLevel0Table() {
                    meta_.marked_for_compaction ? " (needs compaction)" : "");
 
     if (s.ok() && output_file_directory_ != nullptr && sync_output_directory_) {
-      s = output_file_directory_->Fsync(IOOptions(), nullptr);
+      s = output_file_directory_->FsyncWithDirOptions(
+          IOOptions(), nullptr,
+          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
     db_mutex_->Lock();
@@ -958,9 +960,11 @@ Status FlushJob::WriteLevel0Table() {
     edit_->AddFile(0 /* level */, meta_.fd.GetNumber(), meta_.fd.GetPathId(),
                    meta_.fd.GetFileSize(), meta_.smallest, meta_.largest,
                    meta_.fd.smallest_seqno, meta_.fd.largest_seqno,
-                   meta_.marked_for_compaction, meta_.oldest_blob_file_number,
-                   meta_.oldest_ancester_time, meta_.file_creation_time,
-                   meta_.file_checksum, meta_.file_checksum_func_name);
+                   meta_.marked_for_compaction, meta_.temperature,
+                   meta_.oldest_blob_file_number, meta_.oldest_ancester_time,
+                   meta_.file_creation_time, meta_.file_checksum,
+                   meta_.file_checksum_func_name, meta_.min_timestamp,
+                   meta_.max_timestamp);
 
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
   }
@@ -972,7 +976,7 @@ Status FlushJob::WriteLevel0Table() {
   // Note that here we treat flush as level 0 compaction in internal stats
   InternalStats::CompactionStats stats(CompactionReason::kFlush, 1);
   const uint64_t micros = clock_->NowMicros() - start_micros;
-  const uint64_t cpu_micros = clock_->CPUNanos() / 1000 - start_cpu_micros;
+  const uint64_t cpu_micros = clock_->CPUMicros() - start_cpu_micros;
   stats.micros = micros;
   stats.cpu_micros = cpu_micros;
 

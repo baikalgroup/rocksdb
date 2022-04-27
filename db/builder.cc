@@ -328,8 +328,8 @@ Status BuildTable(
       ReadOptions read_options;
       std::unique_ptr<InternalIterator> it(table_cache->NewIterator(
           read_options, file_options, tboptions.internal_comparator, *meta,
-          nullptr /* range_del_agg */,
-          mutable_cf_options.prefix_extractor.get(), nullptr,
+          nullptr /* range_del_agg */, mutable_cf_options.prefix_extractor,
+          nullptr,
           (internal_stats == nullptr) ? nullptr
                                       : internal_stats->GetFileReadHist(0),
           TableReaderCaller::kFlush, /*arena=*/nullptr,
@@ -380,14 +380,19 @@ Status BuildTable(
     }
   }
 
+  Status status_for_listener = s;
   if (meta->fd.GetFileSize() == 0) {
     fname = "(nil)";
+    if (s.ok()) {
+      status_for_listener = Status::Aborted("Empty SST file not kept");
+    }
   }
   // Output to event logger and fire events.
   EventHelpers::LogAndNotifyTableFileCreationFinished(
       event_logger, ioptions.listeners, dbname, tboptions.column_family_name,
       fname, job_id, meta->fd, meta->oldest_blob_file_number, tp,
-      tboptions.reason, s, file_checksum, file_checksum_func_name);
+      tboptions.reason, status_for_listener, file_checksum,
+      file_checksum_func_name);
 
   return s;
 }
