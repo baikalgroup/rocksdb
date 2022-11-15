@@ -17,7 +17,6 @@ CPPFLAGS('''
             -DROCKSDB_RANGESYNC_PRESENT 
             -DROCKSDB_PTHREAD_ADAPTIVE_MUTEX 
             -DROCKSDB_AUXV_GETAUXVAL_PRESENT 
-            -DROCKSDB_SUPPORT_THREAD_LOCAL 
             -DROCKSDB_PLATFORM_POSIX 
             -DROCKSDB_LIB_IO_POSIX 
             -DROCKSDB_FALLOCATE_PRESENT 
@@ -30,7 +29,7 @@ CFLAGS('-pipe -g -ggdb -W -Wall -fPIC')
 
 #C++ flags.
 #CXXFLAGS('-std=c++11 -g -pipe -W -Wall -fPIC')
-CXXFLAGS('-std=c++11 -g -ggdb -pipe -W -fPIC -msse -msse4.2 -mpclmul -Wall -fno-omit-frame-pointer -Wno-unused-parameter')
+CXXFLAGS('-std=c++17 -g -ggdb -pipe -W -fPIC -msse -msse4.2 -mpclmul -Wall -fno-omit-frame-pointer -Wno-unused-parameter -Wno-invalid-offsetof')
 
 #-I path
 INCPATHS('. ./include ./third-party/gtest-1.7.0/fused-src ./third-party/fbson')
@@ -50,9 +49,12 @@ LIB_SOURCES="""
   cache/cache_key.cc
   cache/cache_reservation_manager.cc
   cache/clock_cache.cc                                          \
+  cache/compressed_secondary_cache.cc
+  cache/fast_lru_cache.cc
   cache/lru_cache.cc                                            \
   cache/sharded_cache.cc                                        \
   db/arena_wrapped_db_iter.cc 
+  db/blob/blob_contents.cc
   db/blob/blob_fetcher.cc
   db/blob/blob_file_addition.cc
   db/blob/blob_file_builder.cc
@@ -64,6 +66,7 @@ LIB_SOURCES="""
   db/blob/blob_log_format.cc
   db/blob/blob_log_sequential_reader.cc
   db/blob/blob_log_writer.cc
+  db/blob/blob_source.cc
   db/blob/prefetch_buffer_collection.cc
   db/builder.cc                                                 \
   db/c.cc                                                       \
@@ -75,7 +78,11 @@ LIB_SOURCES="""
   db/compaction/compaction_picker_fifo.cc
   db/compaction/compaction_picker_level.cc
   db/compaction/compaction_picker_universal.cc
+  db/compaction/compaction_service_job.cc
+  db/compaction/compaction_state.cc
+  db/compaction/compaction_outputs.cc
   db/compaction/sst_partitioner.cc
+  db/compaction/subcompaction_state.cc
   db/convenience.cc                                             \
   db/db_filesnapshot.cc                                         \
   db/db_impl/db_impl.cc
@@ -109,10 +116,11 @@ LIB_SOURCES="""
   db/merge_helper.cc                                            \
   db/merge_operator.cc                                          \
   db/output_validator.cc
-  db/periodic_work_scheduler.cc
+  db/periodic_task_scheduler.cc
   db/range_del_aggregator.cc                                    \
   db/range_tombstone_fragmenter.cc                              \
   db/repair.cc                                                  \
+  db/seqno_to_time_mapping.cc
   db/snapshot_impl.cc                                           \
   db/table_cache.cc                                             \
   db/table_properties_collector.cc                              \
@@ -124,6 +132,8 @@ LIB_SOURCES="""
   db/version_set.cc                                             \
   db/wal_edit.cc
   db/wal_manager.cc                                             \
+  db/wide/wide_column_serialization.cc
+  db/wide/wide_columns.cc
   db/write_batch.cc                                             \
   db/write_batch_base.cc                                        \
   db/write_controller.cc                                        \
@@ -132,7 +142,6 @@ LIB_SOURCES="""
   env/env.cc                                                    \
   env/env_chroot.cc                                             \
   env/env_encryption.cc                                         \
-  env/env_hdfs.cc                                               \
   env/env_posix.cc                                              \
   env/fs_posix.cc                                              \
   env/file_system.cc                                              \
@@ -192,7 +201,6 @@ LIB_SOURCES="""
   table/adaptive/adaptive_table_factory.cc
   table/block_based/binary_search_index_reader.cc
   table/block_based/block.cc
-  table/block_based/block_based_filter_block.cc
   table/block_based/block_based_table_builder.cc
   table/block_based/block_based_table_factory.cc
   table/block_based/block_based_table_iterator.cc
@@ -248,6 +256,8 @@ LIB_SOURCES="""
   tools/sst_dump_tool.cc
   tools/trace_analyzer_tool.cc
   trace_replay/block_cache_tracer.cc
+  util/async_file_reader.cc
+  util/cleanable.cc
   trace_replay/io_tracer.cc
   trace_replay/trace_record_handler.cc
   trace_replay/trace_record_result.cc
@@ -257,6 +267,7 @@ LIB_SOURCES="""
   util/coding.cc                                                \
   util/compaction_job_stats_impl.cc                             \
   util/comparator.cc                                            \
+  util/compression.cc
   util/compression_context_cache.cc                             \
   util/concurrent_task_limiter_impl.cc
   util/crc32c.cc                                                \
@@ -266,7 +277,6 @@ LIB_SOURCES="""
   util/random.cc                                                \
   util/rate_limiter.cc                                          \
   util/ribbon_config.cc
-  util/regex.cc
   util/slice.cc                                                 \
   util/file_checksum_helper.cc                                                 \
   util/status.cc                                                \
@@ -274,7 +284,8 @@ LIB_SOURCES="""
   util/thread_local.cc                                          \
   util/threadpool_imp.cc                                        \
   util/xxhash.cc                                                \
-  utilities/backupable/backupable_db.cc                         \
+  utilities/agg_merge/agg_merge.cc
+  utilities/backup/backup_engine.cc
   utilities/blob_db/blob_compaction_filter.cc                   \
   utilities/blob_db/blob_db.cc                                  \
   utilities/blob_db/blob_db_impl.cc                             \
@@ -286,6 +297,7 @@ LIB_SOURCES="""
   utilities/checkpoint/checkpoint_impl.cc                       \
   utilities/compaction_filters.cc
   utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc    \
+  utilities/counted_fs.cc
   utilities/debug.cc                                            \
   utilities/env_mirror.cc                                       \
   utilities/env_timed.cc                                        \

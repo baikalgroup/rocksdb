@@ -37,7 +37,6 @@
 #include "rocksdb/table.h"
 #include "rocksdb/types.h"
 #include "table/block_based/block.h"
-#include "table/block_based/block_based_filter_block.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
@@ -78,8 +77,7 @@ FilterBlockBuilder* CreateFilterBlockBuilder(
   FilterBitsBuilder* filter_bits_builder =
       BloomFilterPolicy::GetBuilderFromContext(context);
   if (filter_bits_builder == nullptr) {
-    return new BlockBasedFilterBlockBuilder(mopt.prefix_extractor.get(),
-                                            table_opt);
+    return nullptr;
   } else {
     if (table_opt.partition_filters) {
       assert(p_index_builder != nullptr);
@@ -318,7 +316,7 @@ struct BlockBasedTableBuilder::Rep {
   // `kBuffered` state is allowed only as long as the buffering of uncompressed
   // data blocks (see `data_block_buffers`) does not exceed `buffer_limit`.
   uint64_t buffer_limit;
-  std::unique_ptr<CacheReservationManager>
+  std::shared_ptr<CacheReservationManager>
       compression_dict_buffer_cache_res_mgr;
   const bool use_delta_encoding_for_index_values;
   std::unique_ptr<FilterBlockBuilder> filter_builder;
@@ -386,6 +384,7 @@ struct BlockBasedTableBuilder::Rep {
   }
 
   // Never erase an existing I/O status that is not OK.
+  // Calling this will also SetStatus(ios)
   void SetIOStatus(IOStatus ios) {
     if (!ios.ok() && io_status_ok.load(std::memory_order_relaxed)) {
       // Locking is an overkill for non compression_opts.parallel_threads
@@ -395,6 +394,7 @@ struct BlockBasedTableBuilder::Rep {
       io_status = ios;
       io_status_ok.store(false, std::memory_order_relaxed);
     }
+    SetStatus(ios);
   }
 
   Rep(const BlockBasedTableOptions& table_opt, const TableBuilderOptions& tbo,
@@ -449,12 +449,24 @@ struct BlockBasedTableBuilder::Rep {
       buffer_limit = std::min(tbo.target_file_size,
                               compression_opts.max_dict_buffer_bytes);
     }
-    if (table_options.no_block_cache || table_options.block_cache == nullptr) {
-      compression_dict_buffer_cache_res_mgr.reset(nullptr);
+
+    const auto compress_dict_build_buffer_charged =
+        table_options.cache_usage_options.options_overrides
+            .at(CacheEntryRole::kCompressionDictionaryBuildingBuffer)
+            .charged;
+    if (table_options.block_cache &&
+        (compress_dict_build_buffer_charged ==
+             CacheEntryRoleOptions::Decision::kEnabled ||
+         compress_dict_build_buffer_charged ==
+             CacheEntryRoleOptions::Decision::kFallback)) {
+      compression_dict_buffer_cache_res_mgr =
+          std::make_shared<CacheReservationManagerImpl<
+              CacheEntryRole::kCompressionDictionaryBuildingBuffer>>(
+              table_options.block_cache);
     } else {
-      compression_dict_buffer_cache_res_mgr.reset(
-          new CacheReservationManager(table_options.block_cache));
+      compression_dict_buffer_cache_res_mgr = nullptr;
     }
+
     for (uint32_t i = 0; i < compression_opts.parallel_threads; i++) {
       compression_ctxs[i].reset(new CompressionContext(compression_type));
     }
@@ -529,7 +541,6 @@ struct BlockBasedTableBuilder::Rep {
     // These are only needed for populating table properties
     props.column_family_id = tbo.column_family_id;
     props.column_family_name = tbo.column_family_name;
-    props.creation_time = tbo.creation_time;
     props.oldest_key_time = tbo.oldest_key_time;
     props.file_creation_time = tbo.file_creation_time;
     props.orig_file_number = tbo.cur_file_num;
@@ -880,20 +891,12 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
 
   rep_ = new Rep(sanitized_table_options, tbo, file);
 
-  if (rep_->filter_builder != nullptr) {
-    rep_->filter_builder->StartBlock(0);
-  }
-
   TEST_SYNC_POINT_CALLBACK(
       "BlockBasedTableBuilder::BlockBasedTableBuilder:PreSetupBaseCacheKey",
       const_cast<TableProperties*>(&rep_->props));
 
-  // Extremely large files use atypical cache key encoding, and we don't
-  // know ahead of time how big the file will be. But assuming it's less
-  // than 4TB, we will correctly predict the cache keys.
-  BlockBasedTable::SetupBaseCacheKey(
-      &rep_->props, tbo.db_session_id, tbo.cur_file_num,
-      BlockBasedTable::kMaxFileSizeStandardEncoding, &rep_->base_cache_key);
+  BlockBasedTable::SetupBaseCacheKey(&rep_->props, tbo.db_session_id,
+                                     tbo.cur_file_num, &rep_->base_cache_key);
 
   if (rep_->IsParallelCompressionEnabled()) {
     StartParallelCompression();
@@ -928,16 +931,15 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
             (r->buffer_limit != 0 && r->data_begin_offset > r->buffer_limit);
         bool exceeds_global_block_cache_limit = false;
 
-        // Increase cache reservation for the last buffered data block
+        // Increase cache charging for the last buffered data block
         // only if the block is not going to be unbuffered immediately
         // and there exists a cache reservation manager
         if (!exceeds_buffer_limit &&
             r->compression_dict_buffer_cache_res_mgr != nullptr) {
           Status s =
-              r->compression_dict_buffer_cache_res_mgr->UpdateCacheReservation<
-                  CacheEntryRole::kCompressionDictionaryBuildingBuffer>(
+              r->compression_dict_buffer_cache_res_mgr->UpdateCacheReservation(
                   r->data_begin_offset);
-          exceeds_global_block_cache_limit = s.IsIncomplete();
+          exceeds_global_block_cache_limit = s.IsMemoryLimit();
         }
 
         if (exceeds_buffer_limit || exceeds_global_block_cache_limit) {
@@ -1071,9 +1073,6 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& raw_block_contents,
   WriteRawBlock(block_contents, type, handle, block_type, &raw_block_contents);
   r->compressed_output.clear();
   if (is_data_block) {
-    if (r->filter_builder != nullptr) {
-      r->filter_builder->StartBlock(r->get_offset());
-    }
     r->props.data_size = r->get_offset();
     ++r->props.num_data_blocks;
   }
@@ -1227,96 +1226,104 @@ void BlockBasedTableBuilder::WriteRawBlock(const Slice& block_contents,
                                            CompressionType type,
                                            BlockHandle* handle,
                                            BlockType block_type,
-                                           const Slice* raw_block_contents,
-                                           bool is_top_level_filter_block) {
+                                           const Slice* raw_block_contents) {
   Rep* r = rep_;
   bool is_data_block = block_type == BlockType::kData;
-  Status s = Status::OK();
-  IOStatus io_s = IOStatus::OK();
   StopWatch sw(r->ioptions.clock, r->ioptions.stats, WRITE_RAW_BLOCK_MICROS);
   handle->set_offset(r->get_offset());
   handle->set_size(block_contents.size());
   assert(status().ok());
   assert(io_status().ok());
-  io_s = r->file->Append(block_contents);
-  if (io_s.ok()) {
-    std::array<char, kBlockTrailerSize> trailer;
-    trailer[0] = type;
-    uint32_t checksum = ComputeBuiltinChecksumWithLastByte(
-        r->table_options.checksum, block_contents.data(), block_contents.size(),
-        /*last_byte*/ type);
-    EncodeFixed32(trailer.data() + 1, checksum);
 
-    assert(io_s.ok());
-    TEST_SYNC_POINT_CALLBACK(
-        "BlockBasedTableBuilder::WriteRawBlock:TamperWithChecksum",
-        trailer.data());
-    io_s = r->file->Append(Slice(trailer.data(), trailer.size()));
-    if (io_s.ok()) {
-      assert(s.ok());
-      bool warm_cache;
-      switch (r->table_options.prepopulate_block_cache) {
-        case BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly:
-          warm_cache = (r->reason == TableFileCreationReason::kFlush);
-          break;
-        case BlockBasedTableOptions::PrepopulateBlockCache::kDisable:
-          warm_cache = false;
-          break;
-        default:
-          // missing case
-          assert(false);
-          warm_cache = false;
+  {
+    IOStatus io_s = r->file->Append(block_contents);
+    if (!io_s.ok()) {
+      r->SetIOStatus(io_s);
+      return;
+    }
+  }
+
+  std::array<char, kBlockTrailerSize> trailer;
+  trailer[0] = type;
+  uint32_t checksum = ComputeBuiltinChecksumWithLastByte(
+      r->table_options.checksum, block_contents.data(), block_contents.size(),
+      /*last_byte*/ type);
+
+  if (block_type == BlockType::kFilter) {
+    Status s = r->filter_builder->MaybePostVerifyFilter(block_contents);
+    if (!s.ok()) {
+      r->SetStatus(s);
+      return;
+    }
+  }
+
+  EncodeFixed32(trailer.data() + 1, checksum);
+  TEST_SYNC_POINT_CALLBACK(
+      "BlockBasedTableBuilder::WriteRawBlock:TamperWithChecksum",
+      trailer.data());
+  {
+    IOStatus io_s = r->file->Append(Slice(trailer.data(), trailer.size()));
+    if (!io_s.ok()) {
+      r->SetIOStatus(io_s);
+      return;
+    }
+  }
+
+  {
+    Status s = Status::OK();
+    bool warm_cache;
+    switch (r->table_options.prepopulate_block_cache) {
+      case BlockBasedTableOptions::PrepopulateBlockCache::kFlushOnly:
+        warm_cache = (r->reason == TableFileCreationReason::kFlush);
+        break;
+      case BlockBasedTableOptions::PrepopulateBlockCache::kDisable:
+        warm_cache = false;
+        break;
+      default:
+        // missing case
+        assert(false);
+        warm_cache = false;
+    }
+    if (warm_cache) {
+      if (type == kNoCompression) {
+        s = InsertBlockInCacheHelper(block_contents, handle, block_type);
+      } else if (raw_block_contents != nullptr) {
+        s = InsertBlockInCacheHelper(*raw_block_contents, handle, block_type);
       }
-      if (warm_cache) {
-        if (type == kNoCompression) {
-          s = InsertBlockInCacheHelper(block_contents, handle, block_type,
-                                       is_top_level_filter_block);
-        } else if (raw_block_contents != nullptr) {
-          s = InsertBlockInCacheHelper(*raw_block_contents, handle, block_type,
-                                       is_top_level_filter_block);
-        }
-        if (!s.ok()) {
-          r->SetStatus(s);
-        }
-      }
-      // TODO:: Should InsertBlockInCompressedCache take into account error from
-      // InsertBlockInCache or ignore and overwrite it.
-      s = InsertBlockInCompressedCache(block_contents, type, handle);
       if (!s.ok()) {
         r->SetStatus(s);
+        return;
       }
+    }
+    s = InsertBlockInCompressedCache(block_contents, type, handle);
+    if (!s.ok()) {
+      r->SetStatus(s);
+      return;
+    }
+  }
+
+  r->set_offset(r->get_offset() + block_contents.size() + kBlockTrailerSize);
+  if (r->table_options.block_align && is_data_block) {
+    size_t pad_bytes =
+        (r->alignment -
+         ((block_contents.size() + kBlockTrailerSize) & (r->alignment - 1))) &
+        (r->alignment - 1);
+    IOStatus io_s = r->file->Pad(pad_bytes);
+    if (io_s.ok()) {
+      r->set_offset(r->get_offset() + pad_bytes);
     } else {
       r->SetIOStatus(io_s);
+      return;
     }
-    if (s.ok() && io_s.ok()) {
-      r->set_offset(r->get_offset() + block_contents.size() +
-                    kBlockTrailerSize);
-      if (r->table_options.block_align && is_data_block) {
-        size_t pad_bytes =
-            (r->alignment - ((block_contents.size() + kBlockTrailerSize) &
-                             (r->alignment - 1))) &
-            (r->alignment - 1);
-        io_s = r->file->Pad(pad_bytes);
-        if (io_s.ok()) {
-          r->set_offset(r->get_offset() + pad_bytes);
-        } else {
-          r->SetIOStatus(io_s);
-        }
-      }
-      if (r->IsParallelCompressionEnabled()) {
-        if (is_data_block) {
-          r->pc_rep->file_size_estimator.ReapBlock(block_contents.size(),
-                                                   r->get_offset());
-        } else {
-          r->pc_rep->file_size_estimator.SetEstimatedFileSize(r->get_offset());
-        }
-      }
-    }
-  } else {
-    r->SetIOStatus(io_s);
   }
-  if (!io_s.ok() && s.ok()) {
-    r->SetStatus(io_s);
+
+  if (r->IsParallelCompressionEnabled()) {
+    if (is_data_block) {
+      r->pc_rep->file_size_estimator.ReapBlock(block_contents.size(),
+                                               r->get_offset());
+    } else {
+      r->pc_rep->file_size_estimator.SetEstimatedFileSize(r->get_offset());
+    }
   }
 }
 
@@ -1354,9 +1361,6 @@ void BlockBasedTableBuilder::BGWorkWriteRawBlock() {
       break;
     }
 
-    if (r->filter_builder != nullptr) {
-      r->filter_builder->StartBlock(r->get_offset());
-    }
     r->props.data_size = r->get_offset();
     ++r->props.num_data_blocks;
 
@@ -1457,25 +1461,25 @@ Status BlockBasedTableBuilder::InsertBlockInCompressedCache(
 
 Status BlockBasedTableBuilder::InsertBlockInCacheHelper(
     const Slice& block_contents, const BlockHandle* handle,
-    BlockType block_type, bool is_top_level_filter_block) {
+    BlockType block_type) {
   Status s;
-  if (block_type == BlockType::kData || block_type == BlockType::kIndex) {
-    s = InsertBlockInCache<Block>(block_contents, handle, block_type);
-  } else if (block_type == BlockType::kFilter) {
-    if (rep_->filter_builder->IsBlockBased()) {
-      // for block-based filter which is deprecated.
-      s = InsertBlockInCache<BlockContents>(block_contents, handle, block_type);
-    } else if (is_top_level_filter_block) {
-      // for top level filter block in partitioned filter.
+  switch (block_type) {
+    case BlockType::kData:
+    case BlockType::kIndex:
+    case BlockType::kFilterPartitionIndex:
       s = InsertBlockInCache<Block>(block_contents, handle, block_type);
-    } else {
-      // for second level partitioned filters and full filters.
+      break;
+    case BlockType::kFilter:
       s = InsertBlockInCache<ParsedFullFilterBlock>(block_contents, handle,
                                                     block_type);
-    }
-  } else if (block_type == BlockType::kCompressionDictionary) {
-    s = InsertBlockInCache<UncompressionDict>(block_contents, handle,
-                                              block_type);
+      break;
+    case BlockType::kCompressionDictionary:
+      s = InsertBlockInCache<UncompressionDict>(block_contents, handle,
+                                                block_type);
+      break;
+    default:
+      // no-op / not cached
+      break;
   }
   return s;
 }
@@ -1529,10 +1533,13 @@ Status BlockBasedTableBuilder::InsertBlockInCache(const Slice& block_contents,
 
 void BlockBasedTableBuilder::WriteFilterBlock(
     MetaIndexBuilder* meta_index_builder) {
+  if (rep_->filter_builder == nullptr || rep_->filter_builder->IsEmpty()) {
+    // No filter block needed
+    return;
+  }
   BlockHandle filter_block_handle;
-  bool empty_filter_block =
-      (rep_->filter_builder == nullptr || rep_->filter_builder->IsEmpty());
-  if (ok() && !empty_filter_block) {
+  bool is_partitioned_filter = rep_->table_options.partition_filters;
+  if (ok()) {
     rep_->props.num_filter_entries +=
         rep_->filter_builder->EstimateEntriesAdded();
     Status s = Status::Incomplete();
@@ -1548,41 +1555,39 @@ void BlockBasedTableBuilder::WriteFilterBlock(
       std::unique_ptr<const char[]> filter_data;
       Slice filter_content =
           rep_->filter_builder->Finish(filter_block_handle, &s, &filter_data);
-      assert(s.ok() || s.IsIncomplete());
+
+      assert(s.ok() || s.IsIncomplete() || s.IsCorruption());
+      if (s.IsCorruption()) {
+        rep_->SetStatus(s);
+        break;
+      }
+
       rep_->props.filter_size += filter_content.size();
 
-      // TODO: Refactor code so that BlockType can determine both the C++ type
-      // of a block cache entry (TBlocklike) and the CacheEntryRole while
-      // inserting blocks in cache.
-      bool top_level_filter_block = false;
-      if (s.ok() && rep_->table_options.partition_filters &&
-          !rep_->filter_builder->IsBlockBased()) {
-        top_level_filter_block = true;
-      }
-      WriteRawBlock(filter_content, kNoCompression, &filter_block_handle,
-                    BlockType::kFilter, nullptr /*raw_contents*/,
-                    top_level_filter_block);
+      BlockType btype = is_partitioned_filter && /* last */ s.ok()
+                            ? BlockType::kFilterPartitionIndex
+                            : BlockType::kFilter;
+      WriteRawBlock(filter_content, kNoCompression, &filter_block_handle, btype,
+                    nullptr /*raw_contents*/);
     }
     rep_->filter_builder->ResetFilterBitsBuilder();
   }
-  if (ok() && !empty_filter_block) {
+  if (ok()) {
     // Add mapping from "<filter_block_prefix>.Name" to location
     // of filter data.
     std::string key;
-    if (rep_->filter_builder->IsBlockBased()) {
-      key = BlockBasedTable::kFilterBlockPrefix;
-    } else {
-      key = rep_->table_options.partition_filters
-                ? BlockBasedTable::kPartitionedFilterBlockPrefix
-                : BlockBasedTable::kFullFilterBlockPrefix;
-    }
-    key.append(rep_->table_options.filter_policy->Name());
+    key = is_partitioned_filter ? BlockBasedTable::kPartitionedFilterBlockPrefix
+                                : BlockBasedTable::kFullFilterBlockPrefix;
+    key.append(rep_->table_options.filter_policy->CompatibilityName());
     meta_index_builder->Add(key, filter_block_handle);
   }
 }
 
 void BlockBasedTableBuilder::WriteIndexBlock(
     MetaIndexBuilder* meta_index_builder, BlockHandle* index_block_handle) {
+  if (!ok()) {
+    return;
+  }
   IndexBuilder::IndexBlocks index_blocks;
   auto index_builder_status = rep_->index_builder->Finish(&index_blocks);
   if (index_builder_status.IsIncomplete()) {
@@ -1797,7 +1802,6 @@ void BlockBasedTableBuilder::WriteFooter(BlockHandle& metaindex_block_handle,
     r->set_offset(r->get_offset() + footer.GetSlice().size());
   } else {
     r->SetIOStatus(ios);
-    r->SetStatus(ios);
   }
 }
 
@@ -1854,9 +1858,15 @@ void BlockBasedTableBuilder::EnterUnbuffered() {
   // OK if compression_dict_samples is empty, we'll just get empty dictionary.
   std::string dict;
   if (r->compression_opts.zstd_max_train_bytes > 0) {
-    dict = ZSTD_TrainDictionary(compression_dict_samples,
-                                compression_dict_sample_lens,
-                                r->compression_opts.max_dict_bytes);
+    if (r->compression_opts.use_zstd_dict_trainer) {
+      dict = ZSTD_TrainDictionary(compression_dict_samples,
+                                  compression_dict_sample_lens,
+                                  r->compression_opts.max_dict_bytes);
+    } else {
+      dict = ZSTD_FinalizeDictionary(
+          compression_dict_samples, compression_dict_sample_lens,
+          r->compression_opts.max_dict_bytes, r->compression_opts.level);
+    }
   } else {
     dict = std::move(compression_dict_samples);
   }
@@ -1892,7 +1902,6 @@ void BlockBasedTableBuilder::EnterUnbuffered() {
     }
 
     auto& data_block = r->data_block_buffers[i];
-
     if (r->IsParallelCompressionEnabled()) {
       Slice first_key_in_next_block;
       const Slice* first_key_in_next_block_ptr = &first_key_in_next_block;
@@ -1944,8 +1953,7 @@ void BlockBasedTableBuilder::EnterUnbuffered() {
   r->data_begin_offset = 0;
   // Release all reserved cache for data block buffers
   if (r->compression_dict_buffer_cache_res_mgr != nullptr) {
-    Status s = r->compression_dict_buffer_cache_res_mgr->UpdateCacheReservation<
-        CacheEntryRole::kCompressionDictionaryBuildingBuffer>(
+    Status s = r->compression_dict_buffer_cache_res_mgr->UpdateCacheReservation(
         r->data_begin_offset);
     s.PermitUncheckedError();
   }
@@ -2071,8 +2079,14 @@ const char* BlockBasedTableBuilder::GetFileChecksumFuncName() const {
     return kUnknownFileChecksumFuncName;
   }
 }
+void BlockBasedTableBuilder::SetSeqnoTimeTableProperties(
+    const std::string& encoded_seqno_to_time_mapping,
+    uint64_t oldest_ancestor_time) {
+  rep_->props.seqno_to_time_mapping = encoded_seqno_to_time_mapping;
+  rep_->props.creation_time = oldest_ancestor_time;
+}
 
-const std::string BlockBasedTable::kFilterBlockPrefix = "filter.";
+const std::string BlockBasedTable::kObsoleteFilterBlockPrefix = "filter.";
 const std::string BlockBasedTable::kFullFilterBlockPrefix = "fullfilter.";
 const std::string BlockBasedTable::kPartitionedFilterBlockPrefix =
     "partitionedfilter.";

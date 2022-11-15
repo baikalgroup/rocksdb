@@ -78,7 +78,8 @@ bool ExpectedState::Exists(int cf, int64_t key) {
 void ExpectedState::Reset() {
   for (size_t i = 0; i < num_column_families_; ++i) {
     for (size_t j = 0; j < max_key_; ++j) {
-      Delete(static_cast<int>(i), j, false /* pending */);
+      Value(static_cast<int>(i), j)
+          .store(SharedState::DELETION_SENTINEL, std::memory_order_relaxed);
     }
   }
 }
@@ -186,8 +187,8 @@ Status FileExpectedStateManager::Open() {
     // Check if crash happened after creating state file but before creating
     // trace file.
     if (saved_seqno_ != kMaxSequenceNumber) {
-      std::string saved_seqno_trace_path =
-          GetPathForFilename(ToString(saved_seqno_) + kTraceFilenameSuffix);
+      std::string saved_seqno_trace_path = GetPathForFilename(
+          std::to_string(saved_seqno_) + kTraceFilenameSuffix);
       Status exists_status = Env::Default()->FileExists(saved_seqno_trace_path);
       if (exists_status.ok()) {
         found_trace = true;
@@ -204,7 +205,7 @@ Status FileExpectedStateManager::Open() {
     std::unique_ptr<WritableFile> wfile;
     const EnvOptions soptions;
     std::string saved_seqno_trace_path =
-        GetPathForFilename(ToString(saved_seqno_) + kTraceFilenameSuffix);
+        GetPathForFilename(std::to_string(saved_seqno_) + kTraceFilenameSuffix);
     s = Env::Default()->NewWritableFile(saved_seqno_trace_path, &wfile,
                                         soptions);
   }
@@ -256,21 +257,21 @@ Status FileExpectedStateManager::Open() {
 Status FileExpectedStateManager::SaveAtAndAfter(DB* db) {
   SequenceNumber seqno = db->GetLatestSequenceNumber();
 
-  std::string state_filename = ToString(seqno) + kStateFilenameSuffix;
+  std::string state_filename = std::to_string(seqno) + kStateFilenameSuffix;
   std::string state_file_temp_path = GetTempPathForFilename(state_filename);
   std::string state_file_path = GetPathForFilename(state_filename);
 
   std::string latest_file_path =
       GetPathForFilename(kLatestBasename + kStateFilenameSuffix);
 
-  std::string trace_filename = ToString(seqno) + kTraceFilenameSuffix;
+  std::string trace_filename = std::to_string(seqno) + kTraceFilenameSuffix;
   std::string trace_file_path = GetPathForFilename(trace_filename);
 
   // Populate a tempfile and then rename it to atomically create "<seqno>.state"
   // with contents from "LATEST.state"
-  Status s =
-      CopyFile(FileSystem::Default(), latest_file_path, state_file_temp_path,
-               0 /* size */, false /* use_fsync */);
+  Status s = CopyFile(FileSystem::Default(), latest_file_path,
+                      state_file_temp_path, 0 /* size */, false /* use_fsync */,
+                      nullptr /* io_tracer */, Temperature::kUnknown);
   if (s.ok()) {
     s = FileSystem::Default()->RenameFile(state_file_temp_path, state_file_path,
                                           IOOptions(), nullptr /* dbg */);
@@ -310,13 +311,13 @@ Status FileExpectedStateManager::SaveAtAndAfter(DB* db) {
   // again, even if we crash.
   if (s.ok() && old_saved_seqno != kMaxSequenceNumber &&
       old_saved_seqno != saved_seqno_) {
-    s = Env::Default()->DeleteFile(
-        GetPathForFilename(ToString(old_saved_seqno) + kStateFilenameSuffix));
+    s = Env::Default()->DeleteFile(GetPathForFilename(
+        std::to_string(old_saved_seqno) + kStateFilenameSuffix));
   }
   if (s.ok() && old_saved_seqno != kMaxSequenceNumber &&
       old_saved_seqno != saved_seqno_) {
-    s = Env::Default()->DeleteFile(
-        GetPathForFilename(ToString(old_saved_seqno) + kTraceFilenameSuffix));
+    s = Env::Default()->DeleteFile(GetPathForFilename(
+        std::to_string(old_saved_seqno) + kTraceFilenameSuffix));
   }
   return s;
 }
@@ -380,8 +381,10 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
   // object, but it's convenient and works to share state with the
   // `TraceRecord::Handler`.
 
-  Status PutCF(uint32_t column_family_id, const Slice& key,
+  Status PutCF(uint32_t column_family_id, const Slice& key_with_ts,
                const Slice& value) override {
+    Slice key =
+        StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
     uint64_t key_id;
     if (!GetIntVal(key.ToString(), &key_id)) {
       return Status::Corruption("unable to parse key", key.ToString());
@@ -394,7 +397,10 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     return Status::OK();
   }
 
-  Status DeleteCF(uint32_t column_family_id, const Slice& key) override {
+  Status DeleteCF(uint32_t column_family_id,
+                  const Slice& key_with_ts) override {
+    Slice key =
+        StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
     uint64_t key_id;
     if (!GetIntVal(key.ToString(), &key_id)) {
       return Status::Corruption("unable to parse key", key.ToString());
@@ -406,12 +412,18 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     return Status::OK();
   }
 
-  Status SingleDeleteCF(uint32_t column_family_id, const Slice& key) override {
-    return DeleteCF(column_family_id, key);
+  Status SingleDeleteCF(uint32_t column_family_id,
+                        const Slice& key_with_ts) override {
+    return DeleteCF(column_family_id, key_with_ts);
   }
 
-  Status DeleteRangeCF(uint32_t column_family_id, const Slice& begin_key,
-                       const Slice& end_key) override {
+  Status DeleteRangeCF(uint32_t column_family_id,
+                       const Slice& begin_key_with_ts,
+                       const Slice& end_key_with_ts) override {
+    Slice begin_key =
+        StripTimestampFromUserKey(begin_key_with_ts, FLAGS_user_timestamp_size);
+    Slice end_key =
+        StripTimestampFromUserKey(end_key_with_ts, FLAGS_user_timestamp_size);
     uint64_t begin_key_id, end_key_id;
     if (!GetIntVal(begin_key.ToString(), &begin_key_id)) {
       return Status::Corruption("unable to parse begin key",
@@ -427,8 +439,10 @@ class ExpectedStateTraceRecordHandler : public TraceRecord::Handler,
     return Status::OK();
   }
 
-  Status MergeCF(uint32_t column_family_id, const Slice& key,
+  Status MergeCF(uint32_t column_family_id, const Slice& key_with_ts,
                  const Slice& value) override {
+    Slice key =
+        StripTimestampFromUserKey(key_with_ts, FLAGS_user_timestamp_size);
     return PutCF(column_family_id, key, value);
   }
 
@@ -447,7 +461,8 @@ Status FileExpectedStateManager::Restore(DB* db) {
     return Status::Corruption("DB is older than any restorable expected state");
   }
 
-  std::string state_filename = ToString(saved_seqno_) + kStateFilenameSuffix;
+  std::string state_filename =
+      std::to_string(saved_seqno_) + kStateFilenameSuffix;
   std::string state_file_path = GetPathForFilename(state_filename);
 
   std::string latest_file_temp_path =
@@ -455,7 +470,8 @@ Status FileExpectedStateManager::Restore(DB* db) {
   std::string latest_file_path =
       GetPathForFilename(kLatestBasename + kStateFilenameSuffix);
 
-  std::string trace_filename = ToString(saved_seqno_) + kTraceFilenameSuffix;
+  std::string trace_filename =
+      std::to_string(saved_seqno_) + kTraceFilenameSuffix;
   std::string trace_file_path = GetPathForFilename(trace_filename);
 
   std::unique_ptr<TraceReader> trace_reader;
@@ -467,7 +483,8 @@ Status FileExpectedStateManager::Restore(DB* db) {
     // "LATEST.state". Start off by creating a tempfile so we can later make the
     // new "LATEST.state" appear atomically using `RenameFile()`.
     s = CopyFile(FileSystem::Default(), state_file_path, latest_file_temp_path,
-                 0 /* size */, false /* use_fsync */);
+                 0 /* size */, false /* use_fsync */, nullptr /* io_tracer */,
+                 Temperature::kUnknown);
   }
 
   {
