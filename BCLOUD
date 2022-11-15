@@ -5,7 +5,7 @@ WORKROOT('../../../')
 
 PLATFORM('centos4u3')
 
-COMPILER('gcc82')
+COMPILER('gcc12')
 
 #Preprocessor flags.
 CPPFLAGS(r'-D_GNU_SOURCE -D__STDC_LIMIT_MACROS')
@@ -38,8 +38,8 @@ INCPATHS('. ./include ./third-party/gtest-1.7.0/fused-src ./third-party/fbson')
 LDFLAGS('-lpthread -lrt -lz ')
 
 CONFIGS('thirdsrc/snappy@snappy_1-0-5-100_PD_BL')
-CONFIGS('thirdsrc/gflags@gflags_2-0-0-100_PD_BL')
-CONFIGS("baidu/third-party/bzip2@bzip2_V1.0.8.1_GCC820_4U3_K3_GEN_PD_BL@git_tag")   
+CONFIGS('baidu/third-party/gflags@gflags_V2.2.2_GCC12_GEN_PD_BL')
+CONFIGS("baidu/third-party/bzip2@1.0.8@git_branch")
 CONFIGS("baidu/third-party/zstd@zstd_V1.4.4.1_GCC820_6U3_K2_GEN_PD_BL@git_branch")   
 CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@git_tag")
 
@@ -48,6 +48,7 @@ LIB_SOURCES="""
   cache/cache_entry_roles.cc
   cache/cache_key.cc
   cache/cache_reservation_manager.cc
+  cache/charged_cache.cc
   cache/clock_cache.cc                                          \
   cache/compressed_secondary_cache.cc
   cache/fast_lru_cache.cc
@@ -85,6 +86,7 @@ LIB_SOURCES="""
   db/compaction/subcompaction_state.cc
   db/convenience.cc                                             \
   db/db_filesnapshot.cc                                         \
+  db/db_impl/compacted_db_impl.cc
   db/db_impl/db_impl.cc
   db/db_impl/db_impl_write.cc
   db/db_impl/db_impl_compaction_flush.cc
@@ -280,6 +282,7 @@ LIB_SOURCES="""
   util/slice.cc                                                 \
   util/file_checksum_helper.cc                                                 \
   util/status.cc                                                \
+  util/stderr_logger.cc
   util/string_util.cc                                           \
   util/thread_local.cc                                          \
   util/threadpool_imp.cc                                        \
