@@ -5,7 +5,7 @@ WORKROOT('../../../')
 
 PLATFORM('centos4u3')
 
-COMPILER('gcc12')
+COMPILER('gcc82')
 
 #Preprocessor flags.
 CPPFLAGS(r'-D_GNU_SOURCE -D__STDC_LIMIT_MACROS')
