@@ -694,6 +694,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestFileWithGlobalSeqnoPickedSeqno) {
   bool verify_checksums_before_ingest = std::get<1>(GetParam());
   do {
     Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
     DestroyAndReopen(options);
     std::map<std::string, std::string> true_data;
 
@@ -800,6 +801,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestFileWithMultipleValueType) {
   bool verify_checksums_before_ingest = std::get<1>(GetParam());
   do {
     Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
     options.merge_operator.reset(new TestPutOperator());
     DestroyAndReopen(options);
     std::map<std::string, std::string> true_data;
@@ -927,6 +929,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestFileWithMixedValueType) {
   bool verify_checksums_before_ingest = std::get<1>(GetParam());
   do {
     Options options = CurrentOptions();
+    options.disable_auto_compactions = true;
     options.merge_operator.reset(new TestPutOperator());
     DestroyAndReopen(options);
     std::map<std::string, std::string> true_data;
@@ -1472,7 +1475,7 @@ TEST_P(ExternalSSTFileBasicTest, IngestFileWithBadBlockChecksum) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   SyncPoint::GetInstance()->SetCallBack(
-      "BlockBasedTableBuilder::WriteRawBlock:TamperWithChecksum",
+      "BlockBasedTableBuilder::WriteMaybeCompressedBlock:TamperWithChecksum",
       change_checksum);
   SyncPoint::GetInstance()->EnableProcessing();
   int file_id = 0;

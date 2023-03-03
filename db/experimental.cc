@@ -94,7 +94,9 @@ Status UpdateManifestForFilesState(
 
         std::unique_ptr<FSSequentialFile> f;
         FileOptions fopts;
-        fopts.temperature = lf->temperature;
+        // Use kUnknown to signal the FileSystem to search all tiers for the
+        // file.
+        fopts.temperature = Temperature::kUnknown;
 
         IOStatus file_ios =
             fs->NewSequentialFile(fname, fopts, &f, /*dbg*/ nullptr);
@@ -110,8 +112,9 @@ Status UpdateManifestForFilesState(
                   lf->smallest, lf->largest, lf->fd.smallest_seqno,
                   lf->fd.largest_seqno, lf->marked_for_compaction, temp,
                   lf->oldest_blob_file_number, lf->oldest_ancester_time,
-                  lf->file_creation_time, lf->file_checksum,
-                  lf->file_checksum_func_name, lf->unique_id);
+                  lf->file_creation_time, lf->epoch_number, lf->file_checksum,
+                  lf->file_checksum_func_name, lf->unique_id,
+                  lf->compensated_range_deletion_size);
             }
           }
         } else {

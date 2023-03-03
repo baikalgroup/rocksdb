@@ -31,18 +31,6 @@ Status DBImpl::TEST_SwitchWAL() {
   return s;
 }
 
-bool DBImpl::TEST_WALBufferIsEmpty(bool lock) {
-  if (lock) {
-    log_write_mutex_.Lock();
-  }
-  log::Writer* cur_log_writer = logs_.back().writer;
-  auto res = cur_log_writer->TEST_BufferIsEmpty();
-  if (lock) {
-    log_write_mutex_.Unlock();
-  }
-  return res;
-}
-
 uint64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
     ColumnFamilyHandle* column_family) {
   ColumnFamilyData* cfd;
@@ -302,7 +290,7 @@ size_t DBImpl::TEST_GetWalPreallocateBlockSize(
 }
 
 #ifndef ROCKSDB_LITE
-void DBImpl::TEST_WaitForPeridicTaskRun(std::function<void()> callback) const {
+void DBImpl::TEST_WaitForPeriodicTaskRun(std::function<void()> callback) const {
   periodic_task_scheduler_.TEST_WaitForRun(callback);
 }
 

@@ -74,4 +74,3 @@ std::string GetRocksBuildInfoAsString(const std::string& program, bool verbose) 
   return info;
 }
 } // namespace ROCKSDB_NAMESPACE
-

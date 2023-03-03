@@ -4,9 +4,11 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include "db/memtable_list.h"
+
 #include <algorithm>
 #include <string>
 #include <vector>
+
 #include "db/merge_context.h"
 #include "db/version_set.h"
 #include "db/write_controller.h"
@@ -1031,6 +1033,7 @@ TEST_F(MemTableListTest, AtomicFlusTest) {
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }

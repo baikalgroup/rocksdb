@@ -245,11 +245,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
   endif(HAS_S390X_MARCH_NATIVE)
 endif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
+  CHECK_C_COMPILER_FLAG("-march=loongarch64" HAS_LOONGARCH64)
+  if(HAS_LOONGARCH64)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mcpu=loongarch64 -mtune=loongarch64")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=loongarch64 -mtune=loongarch64")
+  endif(HAS_LOONGARCH64)
+endif(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
+
 option(PORTABLE "build a portable binary" OFF)
 option(FORCE_SSE42 "force building with SSE4.2, even when PORTABLE=ON" OFF)
 option(FORCE_AVX "force building with AVX, even when PORTABLE=ON" OFF)
 option(FORCE_AVX2 "force building with AVX2, even when PORTABLE=ON" OFF)
 if(PORTABLE)
+  add_definitions(-DROCKSDB_PORTABLE)
+
   # MSVC does not need a separate compiler flag to enable SSE4.2; if nmmintrin.h
   # is available, it is available by default.
   if(FORCE_SSE42 AND NOT MSVC)
@@ -273,6 +283,9 @@ if(PORTABLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^s390x")
       set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=z196")
     endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^loongarch64")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=loongarch64")
+    endif()
   endif()
 else()
   if(MSVC)
@@ -292,8 +305,7 @@ if(NOT MSVC)
   set(CMAKE_REQUIRED_FLAGS "-msse4.2 -mpclmul")
 endif()
 
-if (NOT PORTABLE OR FORCE_SSE42)
-  CHECK_CXX_SOURCE_COMPILES("
+CHECK_CXX_SOURCE_COMPILES("
 #include <cstdint>
 #include <nmmintrin.h>
 #include <wmmintrin.h>
@@ -305,12 +317,11 @@ int main() {
   auto d = _mm_cvtsi128_si64(c);
 }
 " HAVE_SSE42)
-  if(HAVE_SSE42)
-    add_definitions(-DHAVE_SSE42)
-    add_definitions(-DHAVE_PCLMUL)
-  elseif(FORCE_SSE42)
-    message(FATAL_ERROR "FORCE_SSE42=ON but unable to compile with SSE4.2 enabled")
-  endif()
+if(HAVE_SSE42)
+  add_definitions(-DHAVE_SSE42)
+  add_definitions(-DHAVE_PCLMUL)
+elseif(FORCE_SSE42)
+  message(FATAL_ERROR "FORCE_SSE42=ON but unable to compile with SSE4.2 enabled")
 endif()
 
 # Check if -latomic is required or not
@@ -649,12 +660,13 @@ set(SOURCES
         cache/cache.cc
         cache/cache_entry_roles.cc
         cache/cache_key.cc
+        cache/cache_helpers.cc
         cache/cache_reservation_manager.cc
         cache/charged_cache.cc
         cache/clock_cache.cc
         cache/compressed_secondary_cache.cc
-        cache/fast_lru_cache.cc
         cache/lru_cache.cc
+        cache/secondary_cache.cc
         cache/sharded_cache.cc
         db/arena_wrapped_db_iter.cc
         db/blob/blob_contents.cc
@@ -796,6 +808,7 @@ set(SOURCES
         options/options.cc
         options/options_helper.cc
         options/options_parser.cc
+        port/mmap.cc
         port/stack_trace.cc
         table/adaptive/adaptive_table_factory.cc
         table/block_based/binary_search_index_reader.cc
@@ -805,6 +818,7 @@ set(SOURCES
         table/block_based/block_based_table_iterator.cc
         table/block_based/block_based_table_reader.cc
         table/block_based/block_builder.cc
+        table/block_based/block_cache.cc
         table/block_based/block_prefetcher.cc
         table/block_based/block_prefix_index.cc
         table/block_based/data_block_hash_index.cc
@@ -978,6 +992,12 @@ if ( ROCKSDB_PLUGINS )
         plugin/${plugin}/${src}
         PROPERTIES COMPILE_FLAGS "${${plugin}_COMPILE_FLAGS}")
     endforeach()
+    foreach (test ${${plugin}_TESTS})
+      list(APPEND PLUGIN_TESTS plugin/${plugin}/${test})
+      set_source_files_properties(
+        plugin/${plugin}/${test}
+        PROPERTIES COMPILE_FLAGS "${${plugin}_COMPILE_FLAGS}")
+    endforeach()
     foreach (path ${${plugin}_INCLUDE_PATHS})
       include_directories(${path})
     endforeach()
@@ -1065,28 +1085,34 @@ set(ROCKSDB_PLUGIN_BUILTINS "")
 message(STATUS "ROCKSDB PLUGINS TO BUILD ${ROCKSDB_PLUGINS}")
 foreach(PLUGIN IN LISTS PLUGINS)
   set(PLUGIN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/plugin/${PLUGIN}/")
-  message("including rocksb plugin ${PLUGIN_ROOT}")
+  message(STATUS "PLUGIN ${PLUGIN} including rocksb plugin ${PLUGIN_ROOT}")
   set(PLUGINMKFILE "${PLUGIN_ROOT}${PLUGIN}.mk")
   if (NOT EXISTS ${PLUGINMKFILE})
-    message(FATAL_ERROR "Missing plugin makefile: ${PLUGINMKFILE}")
+    message(FATAL_ERROR "PLUGIN ${PLUGIN} Missing plugin makefile: ${PLUGINMKFILE}")
   endif()
   file(READ ${PLUGINMKFILE} PLUGINMK)
+
   string(REGEX MATCH "SOURCES = ([^\n]*)" FOO ${PLUGINMK})
   set(MK_SOURCES ${CMAKE_MATCH_1})
   separate_arguments(MK_SOURCES)
   foreach(MK_FILE IN LISTS MK_SOURCES)
     list(APPEND SOURCES "${PLUGIN_ROOT}${MK_FILE}")
+    message(STATUS "PLUGIN ${PLUGIN} Appending ${PLUGIN_ROOT}${MK_FILE} to SOURCES")
   endforeach()
+
   string(REGEX MATCH "_FUNC = ([^\n]*)" FOO ${PLUGINMK})
   if (NOT ${CMAKE_MATCH_1} STREQUAL "")
     string(APPEND ROCKSDB_PLUGIN_BUILTINS "{\"${PLUGIN}\", " ${CMAKE_MATCH_1} "},")
     string(APPEND ROCKSDB_PLUGIN_EXTERNS "int " ${CMAKE_MATCH_1} "(ROCKSDB_NAMESPACE::ObjectLibrary&, const std::string&); ")
   endif()
+
   string(REGEX MATCH "_LIBS = ([^\n]*)" FOO ${PLUGINMK})
-  if (NOT ${CMAKE_MATCH_1} STREQUAL "")
-    list(APPEND THIRDPARTY_LIBS "${CMAKE_MATCH_1}")
-  endif()
-  message("THIRDPARTY_LIBS=${THIRDPARTY_LIBS}")
+  separate_arguments(CMAKE_MATCH_1)
+  foreach(MK_LIB IN LISTS CMAKE_MATCH_1)
+    list(APPEND THIRDPARTY_LIBS "${MK_LIB}")
+  endforeach()
+  message(STATUS "PLUGIN ${PLUGIN} THIRDPARTY_LIBS=${THIRDPARTY_LIBS}")
+
   #TODO: We need to set any compile/link-time flags and add any link libraries
 endforeach()
 
@@ -1463,6 +1489,7 @@ if(WITH_TESTS)
         utilities/ttl/ttl_test.cc
         utilities/util_merge_operators_test.cc
         utilities/write_batch_with_index/write_batch_with_index_test.cc
+	${PLUGIN_TESTS}
     )
   endif()
 
@@ -1566,9 +1593,9 @@ endif()
 
 option(WITH_TRACE_TOOLS "build with trace tools" ON)
 if(WITH_TRACE_TOOLS)
-  add_executable(block_cache_trace_analyzer_tool${ARTIFACT_SUFFIX}
+  add_executable(block_cache_trace_analyzer${ARTIFACT_SUFFIX}
     tools/block_cache_analyzer/block_cache_trace_analyzer_tool.cc)
-  target_link_libraries(block_cache_trace_analyzer_tool${ARTIFACT_SUFFIX}
+  target_link_libraries(block_cache_trace_analyzer${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${GFLAGS_LIB} ${FOLLY_LIBS})
 
   add_executable(trace_analyzer${ARTIFACT_SUFFIX}

@@ -5,28 +5,22 @@
 
 #include "cache/compressed_secondary_cache.h"
 
-#include <algorithm>
-#include <cstdint>
 #include <iterator>
+#include <memory>
 #include <tuple>
 
-#include "cache/lru_cache.h"
 #include "memory/jemalloc_nodump_allocator.h"
-#include "memory/memory_allocator.h"
-#include "rocksdb/compression_type.h"
 #include "rocksdb/convenience.h"
-#include "rocksdb/secondary_cache.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
-#include "util/compression.h"
-#include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class CompressedSecondaryCacheTest : public testing::Test {
+class CompressedSecondaryCacheTest : public testing::Test,
+                                     public Cache::CreateContext {
  public:
   CompressedSecondaryCacheTest() : fail_create_(false) {}
-  ~CompressedSecondaryCacheTest() {}
+  ~CompressedSecondaryCacheTest() override = default;
 
  protected:
   class TestItem {
@@ -34,23 +28,23 @@ class CompressedSecondaryCacheTest : public testing::Test {
     TestItem(const char* buf, size_t size) : buf_(new char[size]), size_(size) {
       memcpy(buf_.get(), buf, size);
     }
-    ~TestItem() {}
+    ~TestItem() = default;
 
     char* Buf() { return buf_.get(); }
-    size_t Size() { return size_; }
+    [[nodiscard]] size_t Size() const { return size_; }
 
    private:
     std::unique_ptr<char[]> buf_;
     size_t size_;
   };
 
-  static size_t SizeCallback(void* obj) {
-    return reinterpret_cast<TestItem*>(obj)->Size();
+  static size_t SizeCallback(Cache::ObjectPtr obj) {
+    return static_cast<TestItem*>(obj)->Size();
   }
 
-  static Status SaveToCallback(void* from_obj, size_t from_offset,
-                               size_t length, void* out) {
-    TestItem* item = reinterpret_cast<TestItem*>(from_obj);
+  static Status SaveToCallback(Cache::ObjectPtr from_obj, size_t from_offset,
+                               size_t length, char* out) {
+    auto item = static_cast<TestItem*>(from_obj);
     const char* buf = item->Buf();
     EXPECT_EQ(length, item->Size());
     EXPECT_EQ(from_offset, 0);
@@ -58,30 +52,36 @@ class CompressedSecondaryCacheTest : public testing::Test {
     return Status::OK();
   }
 
-  static void DeletionCallback(const Slice& /*key*/, void* obj) {
-    delete reinterpret_cast<TestItem*>(obj);
+  static void DeletionCallback(Cache::ObjectPtr obj,
+                               MemoryAllocator* /*alloc*/) {
+    delete static_cast<TestItem*>(obj);
     obj = nullptr;
   }
 
-  static Cache::CacheItemHelper helper_;
-
-  static Status SaveToCallbackFail(void* /*obj*/, size_t /*offset*/,
-                                   size_t /*size*/, void* /*out*/) {
+  static Status SaveToCallbackFail(Cache::ObjectPtr /*obj*/, size_t /*offset*/,
+                                   size_t /*size*/, char* /*out*/) {
     return Status::NotSupported();
   }
 
-  static Cache::CacheItemHelper helper_fail_;
-
-  Cache::CreateCallback test_item_creator = [&](const void* buf, size_t size,
-                                                void** out_obj,
-                                                size_t* charge) -> Status {
-    if (fail_create_) {
+  static Status CreateCallback(const Slice& data, Cache::CreateContext* context,
+                               MemoryAllocator* /*allocator*/,
+                               Cache::ObjectPtr* out_obj, size_t* out_charge) {
+    auto t = static_cast<CompressedSecondaryCacheTest*>(context);
+    if (t->fail_create_) {
       return Status::NotSupported();
     }
-    *out_obj = reinterpret_cast<void*>(new TestItem((char*)buf, size));
-    *charge = size;
+    *out_obj = new TestItem(data.data(), data.size());
+    *out_charge = data.size();
     return Status::OK();
-  };
+  }
+
+  static constexpr Cache::CacheItemHelper kHelper{
+      CacheEntryRole::kMisc, &DeletionCallback, &SizeCallback, &SaveToCallback,
+      &CreateCallback};
+
+  static constexpr Cache::CacheItemHelper kHelperFail{
+      CacheEntryRole::kMisc, &DeletionCallback, &SizeCallback,
+      &SaveToCallbackFail, &CreateCallback};
 
   void SetFailCreate(bool fail) { fail_create_ = fail; }
 
@@ -91,7 +91,7 @@ class CompressedSecondaryCacheTest : public testing::Test {
     bool is_in_sec_cache{true};
     // Lookup an non-existent key.
     std::unique_ptr<SecondaryCacheResultHandle> handle0 = sec_cache->Lookup(
-        "k0", test_item_creator, true, /*advise_erase=*/true, is_in_sec_cache);
+        "k0", &kHelper, this, true, /*advise_erase=*/true, is_in_sec_cache);
     ASSERT_EQ(handle0, nullptr);
 
     Random rnd(301);
@@ -99,23 +99,21 @@ class CompressedSecondaryCacheTest : public testing::Test {
     std::string str1(rnd.RandomString(1000));
     TestItem item1(str1.data(), str1.length());
     // A dummy handle is inserted if the item is inserted for the first time.
-    ASSERT_OK(sec_cache->Insert("k1", &item1,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k1", &item1, &kHelper));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 1);
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_uncompressed_bytes, 0);
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_compressed_bytes, 0);
 
     std::unique_ptr<SecondaryCacheResultHandle> handle1_1 = sec_cache->Lookup(
-        "k1", test_item_creator, true, /*advise_erase=*/false, is_in_sec_cache);
+        "k1", &kHelper, this, true, /*advise_erase=*/false, is_in_sec_cache);
     ASSERT_EQ(handle1_1, nullptr);
 
     // Insert and Lookup the item k1 for the second time and advise erasing it.
-    ASSERT_OK(sec_cache->Insert("k1", &item1,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k1", &item1, &kHelper));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 1);
 
     std::unique_ptr<SecondaryCacheResultHandle> handle1_2 = sec_cache->Lookup(
-        "k1", test_item_creator, true, /*advise_erase=*/true, is_in_sec_cache);
+        "k1", &kHelper, this, true, /*advise_erase=*/true, is_in_sec_cache);
     ASSERT_NE(handle1_2, nullptr);
     ASSERT_FALSE(is_in_sec_cache);
     if (sec_cache_is_compressed) {
@@ -135,21 +133,19 @@ class CompressedSecondaryCacheTest : public testing::Test {
 
     // Lookup the item k1 again.
     std::unique_ptr<SecondaryCacheResultHandle> handle1_3 = sec_cache->Lookup(
-        "k1", test_item_creator, true, /*advise_erase=*/true, is_in_sec_cache);
+        "k1", &kHelper, this, true, /*advise_erase=*/true, is_in_sec_cache);
     ASSERT_EQ(handle1_3, nullptr);
 
     // Insert and Lookup the item k2.
     std::string str2(rnd.RandomString(1000));
     TestItem item2(str2.data(), str2.length());
-    ASSERT_OK(sec_cache->Insert("k2", &item2,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k2", &item2, &kHelper));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 2);
     std::unique_ptr<SecondaryCacheResultHandle> handle2_1 = sec_cache->Lookup(
-        "k2", test_item_creator, true, /*advise_erase=*/false, is_in_sec_cache);
+        "k2", &kHelper, this, true, /*advise_erase=*/false, is_in_sec_cache);
     ASSERT_EQ(handle2_1, nullptr);
 
-    ASSERT_OK(sec_cache->Insert("k2", &item2,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k2", &item2, &kHelper));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 2);
     if (sec_cache_is_compressed) {
       ASSERT_EQ(get_perf_context()->compressed_sec_cache_uncompressed_bytes,
@@ -161,7 +157,7 @@ class CompressedSecondaryCacheTest : public testing::Test {
       ASSERT_EQ(get_perf_context()->compressed_sec_cache_compressed_bytes, 0);
     }
     std::unique_ptr<SecondaryCacheResultHandle> handle2_2 = sec_cache->Lookup(
-        "k2", test_item_creator, true, /*advise_erase=*/false, is_in_sec_cache);
+        "k2", &kHelper, this, true, /*advise_erase=*/false, is_in_sec_cache);
     ASSERT_NE(handle2_2, nullptr);
     std::unique_ptr<TestItem> val2 =
         std::unique_ptr<TestItem>(static_cast<TestItem*>(handle2_2->Value()));
@@ -230,28 +226,24 @@ class CompressedSecondaryCacheTest : public testing::Test {
     std::string str1(rnd.RandomString(1000));
     TestItem item1(str1.data(), str1.length());
     // Insert a dummy handle.
-    ASSERT_OK(sec_cache->Insert("k1", &item1,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k1", &item1, &kHelper));
     // Insert k1.
-    ASSERT_OK(sec_cache->Insert("k1", &item1,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k1", &item1, &kHelper));
 
     // Insert and Lookup the second item.
     std::string str2(rnd.RandomString(200));
     TestItem item2(str2.data(), str2.length());
     // Insert a dummy handle, k1 is not evicted.
-    ASSERT_OK(sec_cache->Insert("k2", &item2,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k2", &item2, &kHelper));
     bool is_in_sec_cache{false};
     std::unique_ptr<SecondaryCacheResultHandle> handle1 = sec_cache->Lookup(
-        "k1", test_item_creator, true, /*advise_erase=*/false, is_in_sec_cache);
+        "k1", &kHelper, this, true, /*advise_erase=*/false, is_in_sec_cache);
     ASSERT_EQ(handle1, nullptr);
 
     // Insert k2 and k1 is evicted.
-    ASSERT_OK(sec_cache->Insert("k2", &item2,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k2", &item2, &kHelper));
     std::unique_ptr<SecondaryCacheResultHandle> handle2 = sec_cache->Lookup(
-        "k2", test_item_creator, true, /*advise_erase=*/false, is_in_sec_cache);
+        "k2", &kHelper, this, true, /*advise_erase=*/false, is_in_sec_cache);
     ASSERT_NE(handle2, nullptr);
     std::unique_ptr<TestItem> val2 =
         std::unique_ptr<TestItem>(static_cast<TestItem*>(handle2->Value()));
@@ -259,27 +251,24 @@ class CompressedSecondaryCacheTest : public testing::Test {
     ASSERT_EQ(memcmp(val2->Buf(), item2.Buf(), item2.Size()), 0);
 
     // Insert k1 again and a dummy handle is inserted.
-    ASSERT_OK(sec_cache->Insert("k1", &item1,
-                                &CompressedSecondaryCacheTest::helper_));
+    ASSERT_OK(sec_cache->Insert("k1", &item1, &kHelper));
 
     std::unique_ptr<SecondaryCacheResultHandle> handle1_1 = sec_cache->Lookup(
-        "k1", test_item_creator, true, /*advise_erase=*/false, is_in_sec_cache);
+        "k1", &kHelper, this, true, /*advise_erase=*/false, is_in_sec_cache);
     ASSERT_EQ(handle1_1, nullptr);
 
     // Create Fails.
     SetFailCreate(true);
     std::unique_ptr<SecondaryCacheResultHandle> handle2_1 = sec_cache->Lookup(
-        "k2", test_item_creator, true, /*advise_erase=*/true, is_in_sec_cache);
+        "k2", &kHelper, this, true, /*advise_erase=*/true, is_in_sec_cache);
     ASSERT_EQ(handle2_1, nullptr);
 
     // Save Fails.
     std::string str3 = rnd.RandomString(10);
     TestItem item3(str3.data(), str3.length());
     // The Status is OK because a dummy handle is inserted.
-    ASSERT_OK(sec_cache->Insert("k3", &item3,
-                                &CompressedSecondaryCacheTest::helper_fail_));
-    ASSERT_NOK(sec_cache->Insert("k3", &item3,
-                                 &CompressedSecondaryCacheTest::helper_fail_));
+    ASSERT_OK(sec_cache->Insert("k3", &item3, &kHelperFail));
+    ASSERT_NOK(sec_cache->Insert("k3", &item3, &kHelperFail));
 
     sec_cache.reset();
   }
@@ -315,40 +304,35 @@ class CompressedSecondaryCacheTest : public testing::Test {
     get_perf_context()->Reset();
     Random rnd(301);
     std::string str1 = rnd.RandomString(1001);
-    TestItem* item1_1 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert(
-        "k1", item1_1, &CompressedSecondaryCacheTest::helper_, str1.length()));
+    auto item1_1 = new TestItem(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1_1, &kHelper, str1.length()));
 
     std::string str2 = rnd.RandomString(1012);
-    TestItem* item2_1 = new TestItem(str2.data(), str2.length());
+    auto item2_1 = new TestItem(str2.data(), str2.length());
     // After this Insert, primary cache contains k2 and secondary cache contains
     // k1's dummy item.
-    ASSERT_OK(cache->Insert(
-        "k2", item2_1, &CompressedSecondaryCacheTest::helper_, str2.length()));
+    ASSERT_OK(cache->Insert("k2", item2_1, &kHelper, str2.length()));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 1);
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_uncompressed_bytes, 0);
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_compressed_bytes, 0);
 
     std::string str3 = rnd.RandomString(1024);
-    TestItem* item3_1 = new TestItem(str3.data(), str3.length());
+    auto item3_1 = new TestItem(str3.data(), str3.length());
     // After this Insert, primary cache contains k3 and secondary cache contains
     // k1's dummy item and k2's dummy item.
-    ASSERT_OK(cache->Insert(
-        "k3", item3_1, &CompressedSecondaryCacheTest::helper_, str3.length()));
+    ASSERT_OK(cache->Insert("k3", item3_1, &kHelper, str3.length()));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 2);
 
     // After this Insert, primary cache contains k1 and secondary cache contains
     // k1's dummy item, k2's dummy item, and k3's dummy item.
-    TestItem* item1_2 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert(
-        "k1", item1_2, &CompressedSecondaryCacheTest::helper_, str1.length()));
+    auto item1_2 = new TestItem(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1_2, &kHelper, str1.length()));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 3);
 
     // After this Insert, primary cache contains k2 and secondary cache contains
     // k1's item, k2's dummy item, and k3's dummy item.
-    TestItem* item2_2 = new TestItem(str2.data(), str2.length());
-    ASSERT_OK(cache->Insert(
-        "k2", item2_2, &CompressedSecondaryCacheTest::helper_, str2.length()));
+    auto item2_2 = new TestItem(str2.data(), str2.length());
+    ASSERT_OK(cache->Insert("k2", item2_2, &kHelper, str2.length()));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 1);
     if (sec_cache_is_compressed) {
       ASSERT_EQ(get_perf_context()->compressed_sec_cache_uncompressed_bytes,
@@ -362,9 +346,8 @@ class CompressedSecondaryCacheTest : public testing::Test {
 
     // After this Insert, primary cache contains k3 and secondary cache contains
     // k1's item and k2's item.
-    TestItem* item3_2 = new TestItem(str3.data(), str3.length());
-    ASSERT_OK(cache->Insert(
-        "k3", item3_2, &CompressedSecondaryCacheTest::helper_, str3.length()));
+    auto item3_2 = new TestItem(str3.data(), str3.length());
+    ASSERT_OK(cache->Insert("k3", item3_2, &kHelper, str3.length()));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 2);
     if (sec_cache_is_compressed) {
       ASSERT_EQ(get_perf_context()->compressed_sec_cache_uncompressed_bytes,
@@ -377,49 +360,88 @@ class CompressedSecondaryCacheTest : public testing::Test {
     }
 
     Cache::Handle* handle;
-    handle = cache->Lookup("k3", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true,
+    handle = cache->Lookup("k3", &kHelper, this, Cache::Priority::LOW, true,
                            stats.get());
     ASSERT_NE(handle, nullptr);
-    TestItem* val3 = static_cast<TestItem*>(cache->Value(handle));
+    auto val3 = static_cast<TestItem*>(cache->Value(handle));
     ASSERT_NE(val3, nullptr);
     ASSERT_EQ(memcmp(val3->Buf(), item3_2->Buf(), item3_2->Size()), 0);
     cache->Release(handle);
 
     // Lookup an non-existent key.
-    handle = cache->Lookup("k0", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true,
+    handle = cache->Lookup("k0", &kHelper, this, Cache::Priority::LOW, true,
                            stats.get());
     ASSERT_EQ(handle, nullptr);
 
     // This Lookup should just insert a dummy handle in the primary cache
     // and the k1 is still in the secondary cache.
-    handle = cache->Lookup("k1", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true,
+    handle = cache->Lookup("k1", &kHelper, this, Cache::Priority::LOW, true,
                            stats.get());
     ASSERT_NE(handle, nullptr);
     ASSERT_EQ(get_perf_context()->block_cache_standalone_handle_count, 1);
-    TestItem* val1_1 = static_cast<TestItem*>(cache->Value(handle));
+    auto val1_1 = static_cast<TestItem*>(cache->Value(handle));
     ASSERT_NE(val1_1, nullptr);
     ASSERT_EQ(memcmp(val1_1->Buf(), str1.data(), str1.size()), 0);
     cache->Release(handle);
 
     // This Lookup should erase k1 from the secondary cache and insert
     // it into primary cache; then k3 is demoted.
-    handle = cache->Lookup("k1", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true,
+    // k2 and k3 are in secondary cache.
+    handle = cache->Lookup("k1", &kHelper, this, Cache::Priority::LOW, true,
                            stats.get());
     ASSERT_NE(handle, nullptr);
     ASSERT_EQ(get_perf_context()->block_cache_standalone_handle_count, 1);
+    ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 3);
     cache->Release(handle);
 
     // k2 is still in secondary cache.
-    handle = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true,
+    handle = cache->Lookup("k2", &kHelper, this, Cache::Priority::LOW, true,
                            stats.get());
     ASSERT_NE(handle, nullptr);
     ASSERT_EQ(get_perf_context()->block_cache_standalone_handle_count, 2);
     cache->Release(handle);
+
+    // Testing SetCapacity().
+    ASSERT_OK(secondary_cache->SetCapacity(0));
+    handle = cache->Lookup("k3", &kHelper, this, Cache::Priority::LOW, true,
+                           stats.get());
+    ASSERT_EQ(handle, nullptr);
+
+    ASSERT_OK(secondary_cache->SetCapacity(7000));
+    size_t capacity;
+    ASSERT_OK(secondary_cache->GetCapacity(capacity));
+    ASSERT_EQ(capacity, 7000);
+    auto item1_3 = new TestItem(str1.data(), str1.length());
+    // After this Insert, primary cache contains k1.
+    ASSERT_OK(cache->Insert("k1", item1_3, &kHelper, str2.length()));
+    ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 3);
+    ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 4);
+
+    auto item2_3 = new TestItem(str2.data(), str2.length());
+    // After this Insert, primary cache contains k2 and secondary cache contains
+    // k1's dummy item.
+    ASSERT_OK(cache->Insert("k2", item2_3, &kHelper, str1.length()));
+    ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 4);
+
+    auto item1_4 = new TestItem(str1.data(), str1.length());
+    // After this Insert, primary cache contains k1 and secondary cache contains
+    // k1's dummy item and k2's dummy item.
+    ASSERT_OK(cache->Insert("k1", item1_4, &kHelper, str2.length()));
+    ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_dummy_count, 5);
+
+    auto item2_4 = new TestItem(str2.data(), str2.length());
+    // After this Insert, primary cache contains k2 and secondary cache contains
+    // k1's real item and k2's dummy item.
+    ASSERT_OK(cache->Insert("k2", item2_4, &kHelper, str2.length()));
+    ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 5);
+    // This Lookup should just insert a dummy handle in the primary cache
+    // and the k1 is still in the secondary cache.
+    handle = cache->Lookup("k1", &kHelper, this, Cache::Priority::LOW, true,
+                           stats.get());
+
+    ASSERT_NE(handle, nullptr);
+    cache->Release(handle);
+    ASSERT_EQ(get_perf_context()->block_cache_standalone_handle_count, 3);
 
     cache.reset();
     secondary_cache.reset();
@@ -452,20 +474,14 @@ class CompressedSecondaryCacheTest : public testing::Test {
 
     Random rnd(301);
     std::string str1 = rnd.RandomString(1001);
-    auto item1 =
-        std::unique_ptr<TestItem>(new TestItem(str1.data(), str1.length()));
-    ASSERT_NOK(cache->Insert("k1", item1.get(), nullptr, str1.length()));
-    ASSERT_OK(cache->Insert("k1", item1.get(),
-                            &CompressedSecondaryCacheTest::helper_,
-                            str1.length()));
+    auto item1 = std::make_unique<TestItem>(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1.get(), &kHelper, str1.length()));
     item1.release();  // Appease clang-analyze "potential memory leak"
 
     Cache::Handle* handle;
-    handle = cache->Lookup("k2", nullptr, test_item_creator,
-                           Cache::Priority::LOW, true);
+    handle = cache->Lookup("k2", nullptr, this, Cache::Priority::LOW, true);
     ASSERT_EQ(handle, nullptr);
-    handle = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, false);
+    handle = cache->Lookup("k2", &kHelper, this, Cache::Priority::LOW, false);
     ASSERT_EQ(handle, nullptr);
 
     cache.reset();
@@ -500,30 +516,26 @@ class CompressedSecondaryCacheTest : public testing::Test {
 
     Random rnd(301);
     std::string str1 = rnd.RandomString(1001);
-    TestItem* item1 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert("k1", item1,
-                            &CompressedSecondaryCacheTest::helper_fail_,
-                            str1.length()));
+    auto item1 = new TestItem(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1, &kHelperFail, str1.length()));
 
     std::string str2 = rnd.RandomString(1002);
-    TestItem* item2 = new TestItem(str2.data(), str2.length());
+    auto item2 = new TestItem(str2.data(), str2.length());
     // k1 should be demoted to the secondary cache.
-    ASSERT_OK(cache->Insert("k2", item2,
-                            &CompressedSecondaryCacheTest::helper_fail_,
-                            str2.length()));
+    ASSERT_OK(cache->Insert("k2", item2, &kHelperFail, str2.length()));
 
     Cache::Handle* handle;
-    handle = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_fail_,
-                           test_item_creator, Cache::Priority::LOW, true);
+    handle =
+        cache->Lookup("k2", &kHelperFail, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle, nullptr);
     cache->Release(handle);
     // This lookup should fail, since k1 demotion would have failed.
-    handle = cache->Lookup("k1", &CompressedSecondaryCacheTest::helper_fail_,
-                           test_item_creator, Cache::Priority::LOW, true);
+    handle =
+        cache->Lookup("k1", &kHelperFail, this, Cache::Priority::LOW, true);
     ASSERT_EQ(handle, nullptr);
     // Since k1 was not promoted, k2 should still be in cache.
-    handle = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_fail_,
-                           test_item_creator, Cache::Priority::LOW, true);
+    handle =
+        cache->Lookup("k2", &kHelperFail, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle, nullptr);
     cache->Release(handle);
 
@@ -559,29 +571,24 @@ class CompressedSecondaryCacheTest : public testing::Test {
 
     Random rnd(301);
     std::string str1 = rnd.RandomString(1001);
-    TestItem* item1 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert("k1", item1, &CompressedSecondaryCacheTest::helper_,
-                            str1.length()));
+    auto item1 = new TestItem(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1, &kHelper, str1.length()));
 
     std::string str2 = rnd.RandomString(1002);
-    TestItem* item2 = new TestItem(str2.data(), str2.length());
+    auto item2 = new TestItem(str2.data(), str2.length());
     // k1 should be demoted to the secondary cache.
-    ASSERT_OK(cache->Insert("k2", item2, &CompressedSecondaryCacheTest::helper_,
-                            str2.length()));
+    ASSERT_OK(cache->Insert("k2", item2, &kHelper, str2.length()));
 
     Cache::Handle* handle;
     SetFailCreate(true);
-    handle = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true);
+    handle = cache->Lookup("k2", &kHelper, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle, nullptr);
     cache->Release(handle);
     // This lookup should fail, since k1 creation would have failed
-    handle = cache->Lookup("k1", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true);
+    handle = cache->Lookup("k1", &kHelper, this, Cache::Priority::LOW, true);
     ASSERT_EQ(handle, nullptr);
     // Since k1 didn't get promoted, k2 should still be in cache
-    handle = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_,
-                           test_item_creator, Cache::Priority::LOW, true);
+    handle = cache->Lookup("k2", &kHelper, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle, nullptr);
     cache->Release(handle);
 
@@ -617,33 +624,28 @@ class CompressedSecondaryCacheTest : public testing::Test {
 
     Random rnd(301);
     std::string str1 = rnd.RandomString(1001);
-    TestItem* item1_1 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert(
-        "k1", item1_1, &CompressedSecondaryCacheTest::helper_, str1.length()));
+    auto item1_1 = new TestItem(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1_1, &kHelper, str1.length()));
 
     std::string str2 = rnd.RandomString(1002);
     std::string str2_clone{str2};
-    TestItem* item2 = new TestItem(str2.data(), str2.length());
+    auto item2 = new TestItem(str2.data(), str2.length());
     // After this Insert, primary cache contains k2 and secondary cache contains
     // k1's dummy item.
-    ASSERT_OK(cache->Insert("k2", item2, &CompressedSecondaryCacheTest::helper_,
-                            str2.length()));
+    ASSERT_OK(cache->Insert("k2", item2, &kHelper, str2.length()));
 
     // After this Insert, primary cache contains k1 and secondary cache contains
     // k1's dummy item and k2's dummy item.
-    TestItem* item1_2 = new TestItem(str1.data(), str1.length());
-    ASSERT_OK(cache->Insert(
-        "k1", item1_2, &CompressedSecondaryCacheTest::helper_, str1.length()));
+    auto item1_2 = new TestItem(str1.data(), str1.length());
+    ASSERT_OK(cache->Insert("k1", item1_2, &kHelper, str1.length()));
 
-    TestItem* item2_2 = new TestItem(str2.data(), str2.length());
+    auto item2_2 = new TestItem(str2.data(), str2.length());
     // After this Insert, primary cache contains k2 and secondary cache contains
     // k1's item and k2's dummy item.
-    ASSERT_OK(cache->Insert(
-        "k2", item2_2, &CompressedSecondaryCacheTest::helper_, str2.length()));
+    ASSERT_OK(cache->Insert("k2", item2_2, &kHelper, str2.length()));
 
     Cache::Handle* handle2;
-    handle2 = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_,
-                            test_item_creator, Cache::Priority::LOW, true);
+    handle2 = cache->Lookup("k2", &kHelper, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle2, nullptr);
     cache->Release(handle2);
 
@@ -651,14 +653,12 @@ class CompressedSecondaryCacheTest : public testing::Test {
     // strict_capacity_limit is true, but the lookup should still succeed.
     // A k1's dummy item is inserted into primary cache.
     Cache::Handle* handle1;
-    handle1 = cache->Lookup("k1", &CompressedSecondaryCacheTest::helper_,
-                            test_item_creator, Cache::Priority::LOW, true);
+    handle1 = cache->Lookup("k1", &kHelper, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle1, nullptr);
     cache->Release(handle1);
 
     // Since k1 didn't get inserted, k2 should still be in cache
-    handle2 = cache->Lookup("k2", &CompressedSecondaryCacheTest::helper_,
-                            test_item_creator, Cache::Priority::LOW, true);
+    handle2 = cache->Lookup("k2", &kHelper, this, Cache::Priority::LOW, true);
     ASSERT_NE(handle2, nullptr);
     cache->Release(handle2);
 
@@ -699,7 +699,7 @@ class CompressedSecondaryCacheTest : public testing::Test {
     current_chunk = current_chunk->next;
     ASSERT_EQ(current_chunk->size, 98);
 
-    sec_cache->GetDeletionCallback(true)("dummy", chunks_head);
+    sec_cache->GetHelper(true)->del_cb(chunks_head, /*alloc*/ nullptr);
   }
 
   void MergeChunksIntoValueTest() {
@@ -780,22 +780,12 @@ class CompressedSecondaryCacheTest : public testing::Test {
     std::string value_str{value.get(), charge};
     ASSERT_EQ(strcmp(value_str.data(), str.data()), 0);
 
-    sec_cache->GetDeletionCallback(true)("dummy", chunks_head);
+    sec_cache->GetHelper(true)->del_cb(chunks_head, /*alloc*/ nullptr);
   }
 
  private:
   bool fail_create_;
 };
-
-Cache::CacheItemHelper CompressedSecondaryCacheTest::helper_(
-    CompressedSecondaryCacheTest::SizeCallback,
-    CompressedSecondaryCacheTest::SaveToCallback,
-    CompressedSecondaryCacheTest::DeletionCallback);
-
-Cache::CacheItemHelper CompressedSecondaryCacheTest::helper_fail_(
-    CompressedSecondaryCacheTest::SizeCallback,
-    CompressedSecondaryCacheTest::SaveToCallbackFail,
-    CompressedSecondaryCacheTest::DeletionCallback);
 
 class CompressedSecCacheTestWithCompressAndAllocatorParam
     : public CompressedSecondaryCacheTest,
@@ -957,6 +947,7 @@ TEST_F(CompressedSecondaryCacheTest, SplictValueAndMergeChunksTest) {
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
