@@ -30,6 +30,8 @@
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/stop_watch.h"
+#include "logging/logging.h"
+#include <gflags/gflags.h>
 
 // Generate the regular and coroutine versions of some methods by
 // including table_cache_sync_and_async.h twice
@@ -45,7 +47,7 @@
 // clang-format on
 
 namespace ROCKSDB_NAMESPACE {
-
+DEFINE_bool(find_table_log, false, "find_table_log");
 namespace {
 
 static Slice GetSliceForFileNumber(const uint64_t* file_number) {
@@ -198,6 +200,11 @@ Status TableCache::FindTable(
         // Release ownership of table reader.
         table_reader.release();
       }
+    }
+    if (FLAGS_find_table_log) {
+    ROCKS_LOG_WARN(ioptions_.info_log, 
+            "GetTableReader:%lu, level:%d, skip_filters:%d, prefetch:%d, s:%d,%s", 
+            number, level, skip_filters, prefetch_index_and_filter_in_cache, s.ok(), s.ToString().c_str());
     }
     return s;
   }

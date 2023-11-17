@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <gflags/gflags.h>
 
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
@@ -125,7 +126,19 @@ extern const uint64_t kBlockBasedTableMagicNumber;
 extern const std::string kHashIndexPrefixesBlock;
 extern const std::string kHashIndexPrefixesMetadataBlock;
 
-BlockBasedTable::~BlockBasedTable() { delete rep_; }
+DECLARE_bool(find_table_log);
+BlockBasedTable::~BlockBasedTable() { 
+    if (FLAGS_find_table_log) {
+    std::string file_name;
+    if (rep_->file != nullptr) {
+        file_name = rep_->file->file_name();
+    }
+    ROCKS_LOG_WARN(rep_->ioptions.info_log,
+            "~BlockBasedTable: %s, level:%d",
+            file_name.c_str(), rep_->level );
+    }
+    delete rep_; 
+}
 
 namespace {
 // Read the block identified by "handle" from "file".
