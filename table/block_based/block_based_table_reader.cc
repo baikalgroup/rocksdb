@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 #include <gflags/gflags.h>
+#include <execinfo.h>
 
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
@@ -136,6 +137,15 @@ BlockBasedTable::~BlockBasedTable() {
     ROCKS_LOG_WARN(rep_->ioptions.info_log,
             "~BlockBasedTable: %s, level:%d",
             file_name.c_str(), rep_->level );
+    void* buffer[1000];
+    char** strings;
+    int nptrs = backtrace(buffer, 1000);
+    strings = backtrace_symbols(buffer, nptrs);
+    if (strings != NULL) {
+        for (int j = 0; j < nptrs; j++) {
+            ROCKS_LOG_WARN(rep_->ioptions.info_log,"BlockBasedTable:%s", strings[j]);
+        }
+    }
     }
     delete rep_; 
 }
