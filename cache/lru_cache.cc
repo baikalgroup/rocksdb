@@ -403,6 +403,10 @@ Status LRUCacheShard::InsertItem(LRUHandle* e, LRUHandle** handle,
       // capacity if not enough space was freed up.
       LRUHandle* old = table_.Insert(e);
       usage_ += e->total_charge;
+      e->cap_ = capacity_;
+      e->use_ = usage_;
+      e->lru_use_ = lru_usage_;
+      e->elems_ = table_.elems_;
       if (old != nullptr) {
         s = Status::OkOverwritten();
         assert(old->InCache());
@@ -541,6 +545,7 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
         }
         e->Ref();
         e->SetHit();
+        e->hits++;
       }
     }
   }
@@ -694,6 +699,7 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash,
   e->key_length = key.size();
   e->hash = hash;
   e->refs = 0;
+  e->hits = 0;
   e->next = e->prev = nullptr;
   e->SetInCache(true);
   e->SetPriority(priority);

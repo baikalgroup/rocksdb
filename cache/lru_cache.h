@@ -65,6 +65,11 @@ struct LRUHandle {
   uint32_t hash;
   // The number of external refs to this entry. The cache itself is not counted.
   uint32_t refs;
+  int cap_;
+  int use_;
+  int lru_use_;
+  int hits;
+  int elems_;
 
   // Mutable flags - access controlled by mutex
   // The m_ and M_ prefixes (and im_ and IM_ later) are to hopefully avoid
@@ -274,7 +279,7 @@ class LRUHandleTable {
 
   MemoryAllocator* GetAllocator() const { return allocator_; }
 
- private:
+ public:
   // Return a pointer to slot that points to a cache entry that
   // matches key/hash.  If there is no such cache entry, return a
   // pointer to the trailing slot in the corresponding linked list.
