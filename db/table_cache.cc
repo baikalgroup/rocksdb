@@ -30,9 +30,6 @@
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/stop_watch.h"
-#include "cache/lru_cache.h"
-#include "logging/logging.h"
-#include <gflags/gflags.h>
 
 // Generate the regular and coroutine versions of some methods by
 // including table_cache_sync_and_async.h twice
@@ -48,7 +45,7 @@
 // clang-format on
 
 namespace ROCKSDB_NAMESPACE {
-DEFINE_bool(find_table_log, false, "find_table_log");
+
 namespace {
 
 static Slice GetSliceForFileNumber(const uint64_t* file_number) {
@@ -202,25 +199,7 @@ Status TableCache::FindTable(
         table_reader.release();
       }
     }
-    if (FLAGS_find_table_log) {
-        lru_cache::LRUHandle* hd =  (lru_cache::LRUHandle*)(*handle);
-        uint32_t shard = hd->hash % 64;
-        ROCKS_LOG_WARN(ioptions_.info_log, 
-                "GetTableReader:%lu, level:%u, shard:%u, skip_filters:%d, prefetch:%d, s:%d,%s, lru_use:%d, cap:%d, use:%d, elems:%d", 
-                number, level, shard, skip_filters, prefetch_index_and_filter_in_cache, s.ok(), s.ToString().c_str(), 
-                hd->lru_use_, hd->cap_, hd->use_, hd->elems_);
-    }
     return s;
-  }
-  if (FLAGS_find_table_log) {
-        lru_cache::LRUHandle* hd =  (lru_cache::LRUHandle*)(*handle);
-        if (hd->hits == 1 || hd->hits % 1000 == 0) {
-        uint32_t shard = hd->hash % 64;
-        ROCKS_LOG_WARN(ioptions_.info_log, 
-                "GetTableReader:%lu, lookup, level:%d, shard:%u, skip_filters:%d, prefetch:%d, lru_use:%d, cap:%d, use:%d, elems:%d, hits:%d", 
-                number, level, shard, skip_filters, prefetch_index_and_filter_in_cache,  
-                hd->lru_use_, hd->cap_, hd->use_, hd->elems_, hd->hits);
-        }
   }
   return Status::OK();
 }
