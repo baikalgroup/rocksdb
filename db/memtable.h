@@ -20,6 +20,7 @@
 #include "db/kv_checksum.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/read_callback.h"
+#include "db/seqno_to_time_mapping.h"
 #include "db/version_edit.h"
 #include "memory/allocator.h"
 #include "memory/concurrent_arena.h"
@@ -28,6 +29,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/memtablerep.h"
 #include "table/multiget_context.h"
+#include "util/cast_util.h"
 #include "util/dynamic_bloom.h"
 #include "util/hash.h"
 #include "util/hash_containers.h"
@@ -54,11 +56,13 @@ struct ImmutableMemTableOptions {
                                    Slice delta_value,
                                    std::string* merged_value);
   size_t max_successive_merges;
+  bool strict_max_successive_merges;
   Statistics* statistics;
   MergeOperator* merge_operator;
   Logger* info_log;
-  bool allow_data_in_errors;
   uint32_t protection_bytes_per_key;
+  bool allow_data_in_errors;
+  bool paranoid_memory_checks;
 };
 
 // Batched counters to updated when inserting keys in one write batch.
@@ -68,6 +72,7 @@ struct MemTablePostProcessInfo {
   uint64_t data_size = 0;
   uint64_t num_entries = 0;
   uint64_t num_deletes = 0;
+  uint64_t num_range_deletes = 0;
 };
 
 using MultiGetRange = MultiGetContext::Range;
@@ -89,10 +94,10 @@ class MemTable {
   struct KeyComparator : public MemTableRep::KeyComparator {
     const InternalKeyComparator comparator;
     explicit KeyComparator(const InternalKeyComparator& c) : comparator(c) {}
-    virtual int operator()(const char* prefix_len_key1,
-                           const char* prefix_len_key2) const override;
-    virtual int operator()(const char* prefix_len_key,
-                           const DecodedType& key) const override;
+    int operator()(const char* prefix_len_key1,
+                   const char* prefix_len_key2) const override;
+    int operator()(const char* prefix_len_key,
+                   const DecodedType& key) const override;
   };
 
   // MemTables are reference counted.  The initial reference count
@@ -201,7 +206,12 @@ class MemTable {
   // arena: If not null, the arena needs to be used to allocate the Iterator.
   //        Calling ~Iterator of the iterator will destroy all the states but
   //        those allocated in arena.
-  InternalIterator* NewIterator(const ReadOptions& read_options, Arena* arena);
+  // seqno_to_time_mapping: it's used to support return write unix time for the
+  // data, currently only needed for iterators serving user reads.
+  InternalIterator* NewIterator(
+      const ReadOptions& read_options,
+      UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping, Arena* arena,
+      const SliceTransform* prefix_extractor);
 
   // Returns an iterator that yields the range tombstones of the memtable.
   // The caller must ensure that the underlying MemTable remains live
@@ -241,12 +251,14 @@ class MemTable {
   // If do_merge = true the default behavior which is Get value for key is
   // executed. Expected behavior is described right below.
   // If memtable contains a value for key, store it in *value and return true.
-  // If memtable contains a deletion for key, store a NotFound() error
-  // in *status and return true.
+  // If memtable contains a deletion for key, store NotFound() in *status and
+  // return true.
   // If memtable contains Merge operation as the most recent entry for a key,
   //   and the merge process does not stop (not reaching a value or delete),
   //   prepend the current merge operand to *operands.
   //   store MergeInProgress in s, and return false.
+  // If an unexpected error or corruption occurs, store Corruption() or other
+  // error in *status and return true.
   // Else, return false.
   // If any operation was found, its most recent sequence number
   // will be stored in *seq on success (regardless of whether true/false is
@@ -256,6 +268,11 @@ class MemTable {
   // If do_merge = false then any Merge Operands encountered for key are simply
   // stored in merge_context.operands_list and never actually merged to get a
   // final value. The raw Merge Operands are eventually returned to the user.
+  // @param value If not null and memtable contains a value for key, `value`
+  // will be set to the result value.
+  // @param column If not null and memtable contains a value/WideColumn for key,
+  // `column` will be set to the result value/WideColumn.
+  // Note: only one of `value` and `column` can be non-nullptr.
   // @param immutable_memtable Whether this memtable is immutable. Used
   // internally by NewRangeTombstoneIterator(). See comment above
   // NewRangeTombstoneIterator() for more detail.
@@ -318,9 +335,10 @@ class MemTable {
                         const ProtectionInfoKVOS64* kv_prot_info);
 
   // Returns the number of successive merge entries starting from the newest
-  // entry for the key up to the last non-merge entry or last entry for the
-  // key in the memtable.
-  size_t CountSuccessiveMergeEntries(const LookupKey& key);
+  // entry for the key. The count ends when the oldest entry in the memtable
+  // with which the newest entry would be merged is reached, or the count
+  // reaches `limit`.
+  size_t CountSuccessiveMergeEntries(const LookupKey& key, size_t limit);
 
   // Update counters and flush status after inserting a whole write batch
   // Used in concurrent memtable inserts.
@@ -331,6 +349,10 @@ class MemTable {
     if (update_counters.num_deletes != 0) {
       num_deletes_.fetch_add(update_counters.num_deletes,
                              std::memory_order_relaxed);
+    }
+    if (update_counters.num_range_deletes > 0) {
+      num_range_deletes_.fetch_add(update_counters.num_range_deletes,
+                                   std::memory_order_relaxed);
     }
     UpdateFlushState();
   }
@@ -349,8 +371,19 @@ class MemTable {
     return num_deletes_.load(std::memory_order_relaxed);
   }
 
+  // Get total number of range deletions in the mem table.
+  // REQUIRES: external synchronization to prevent simultaneous
+  // operations on the same MemTable (unless this Memtable is immutable).
+  uint64_t num_range_deletes() const {
+    return num_range_deletes_.load(std::memory_order_relaxed);
+  }
+
   uint64_t get_data_size() const {
     return data_size_.load(std::memory_order_relaxed);
+  }
+
+  size_t write_buffer_size() const {
+    return write_buffer_size_.load(std::memory_order_relaxed);
   }
 
   // Dynamically change the memtable's capacity. If set below the current usage,
@@ -499,7 +532,6 @@ class MemTable {
     flush_in_progress_ = in_progress;
   }
 
-#ifndef ROCKSDB_LITE
   void SetFlushJobInfo(std::unique_ptr<FlushJobInfo>&& info) {
     flush_job_info_ = std::move(info);
   }
@@ -507,31 +539,38 @@ class MemTable {
   std::unique_ptr<FlushJobInfo> ReleaseFlushJobInfo() {
     return std::move(flush_job_info_);
   }
-#endif  // !ROCKSDB_LITE
 
   // Returns a heuristic flush decision
   bool ShouldFlushNow();
 
+  // Updates `fragmented_range_tombstone_list_` that will be used to serve reads
+  // when this memtable becomes an immutable memtable (in some
+  // MemtableListVersion::memlist_). Should be called when this memtable is
+  // about to become immutable. May be called multiple times since
+  // SwitchMemtable() may fail.
   void ConstructFragmentedRangeTombstones();
 
   // Returns whether a fragmented range tombstone list is already constructed
   // for this memtable. It should be constructed right before a memtable is
   // added to an immutable memtable list. Note that if a memtable does not have
-  // any range tombstone, then no range tombstone list will ever be constructed.
-  // @param allow_empty Specifies whether a memtable with no range tombstone is
-  // considered to have its fragmented range tombstone list constructed.
-  bool IsFragmentedRangeTombstonesConstructed(bool allow_empty = true) const {
-    if (allow_empty) {
-      return fragmented_range_tombstone_list_.get() != nullptr ||
-             is_range_del_table_empty_;
-    } else {
-      return fragmented_range_tombstone_list_.get() != nullptr;
-    }
+  // any range tombstone, then no range tombstone list will ever be constructed
+  // and true is returned in that case.
+  bool IsFragmentedRangeTombstonesConstructed() const {
+    return fragmented_range_tombstone_list_.get() != nullptr ||
+           is_range_del_table_empty_;
   }
+
+  // Get the newest user-defined timestamp contained in this MemTable. Check
+  // `newest_udt_` for what newer means. This method should only be invoked for
+  // an MemTable that has enabled user-defined timestamp feature and set
+  // `persist_user_defined_timestamps` to false. The tracked newest UDT will be
+  // used by flush job in the background to help check the MemTable's
+  // eligibility for Flush.
+  const Slice& GetNewestUDT() const;
 
   // Returns Corruption status if verification fails.
   static Status VerifyEntryChecksum(const char* entry,
-                                    size_t protection_bytes_per_key,
+                                    uint32_t protection_bytes_per_key,
                                     bool allow_data_in_errors = false);
 
  private:
@@ -555,6 +594,7 @@ class MemTable {
   std::atomic<uint64_t> data_size_;
   std::atomic<uint64_t> num_entries_;
   std::atomic<uint64_t> num_deletes_;
+  std::atomic<uint64_t> num_range_deletes_;
 
   // Dynamically changeable memtable option
   std::atomic<size_t> write_buffer_size_;
@@ -598,7 +638,7 @@ class MemTable {
   const SliceTransform* insert_with_hint_prefix_extractor_;
 
   // Insert hints for each prefix.
-  UnorderedMapH<Slice, void*, SliceHasher> insert_hints_;
+  UnorderedMapH<Slice, void*, SliceHasher32> insert_hints_;
 
   // Timestamp of oldest key
   std::atomic<uint64_t> oldest_key_time_;
@@ -616,10 +656,25 @@ class MemTable {
   // Gets refreshed inside `ApproximateMemoryUsage()` or `ShouldFlushNow`
   std::atomic<uint64_t> approximate_memory_usage_;
 
-#ifndef ROCKSDB_LITE
+  // max range deletions in a memtable,  before automatic flushing, 0 for
+  // unlimited.
+  uint32_t memtable_max_range_deletions_ = 0;
+
   // Flush job info of the current memtable.
   std::unique_ptr<FlushJobInfo> flush_job_info_;
-#endif  // !ROCKSDB_LITE
+
+  // Size in bytes for the user-defined timestamps.
+  size_t ts_sz_;
+
+  // Whether to persist user-defined timestamps
+  bool persist_user_defined_timestamps_;
+
+  // Newest user-defined timestamp contained in this MemTable. For ts1, and ts2
+  // if Comparator::CompareTimestamp(ts1, ts2) > 0, ts1 is considered newer than
+  // ts2. We track this field for a MemTable if its column family has UDT
+  // feature enabled and the `persist_user_defined_timestamp` flag is false.
+  // Otherwise, this field just contains an empty Slice.
+  Slice newest_udt_;
 
   // Updates flush_state_ using ShouldFlushNow()
   void UpdateFlushState();
@@ -657,8 +712,10 @@ class MemTable {
   void UpdateEntryChecksum(const ProtectionInfoKVOS64* kv_prot_info,
                            const Slice& key, const Slice& value, ValueType type,
                            SequenceNumber s, char* checksum_ptr);
+
+  void MaybeUpdateNewestUDT(const Slice& user_key);
 };
 
-extern const char* EncodeKey(std::string* scratch, const Slice& target);
+const char* EncodeKey(std::string* scratch, const Slice& target);
 
 }  // namespace ROCKSDB_NAMESPACE

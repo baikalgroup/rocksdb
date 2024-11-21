@@ -47,7 +47,10 @@ struct EnvOptions;
 
 // Types of checksums to use for checking integrity of logical blocks within
 // files. All checksums currently use 32 bits of checking power (1 in 4B
-// chance of failing to detect random corruption).
+// chance of failing to detect random corruption). Traditionally, the actual
+// checking power can be far from ideal if the corruption is due to misplaced
+// data (e.g. physical blocks out of order in a file, or from another file),
+// which is fixed in format_version=6 (see below).
 enum ChecksumType : char {
   kNoChecksum = 0x0,
   kCRC32c = 0x1,
@@ -124,7 +127,7 @@ struct CacheUsageOptions {
 
 // For advanced user only
 struct BlockBasedTableOptions {
-  static const char* kName() { return "BlockTableOptions"; };
+  static const char* kName() { return "BlockTableOptions"; }
   // @flush_block_policy_factory creates the instances of flush block policy.
   // which provides a configurable way to determine when to flush a block in
   // the block based tables.  If not set, table builder will use the default
@@ -259,21 +262,12 @@ struct BlockBasedTableOptions {
   bool no_block_cache = false;
 
   // If non-NULL use the specified cache for blocks.
-  // If NULL, rocksdb will automatically create and use an 8MB internal cache.
+  // If NULL, rocksdb will automatically create and use a 32MB internal cache.
   std::shared_ptr<Cache> block_cache = nullptr;
 
   // If non-NULL use the specified cache for pages read from device
   // IF NULL, no page cache is used
   std::shared_ptr<PersistentCache> persistent_cache = nullptr;
-
-  // DEPRECATED: This feature is planned for removal in a future release.
-  // Use SecondaryCache instead.
-  //
-  // If non-NULL use the specified cache for compressed blocks.
-  // If NULL, rocksdb will not use a compressed block cache.
-  // Note: though it looks similar to `block_cache`, RocksDB doesn't put the
-  //       same type of object there.
-  std::shared_ptr<Cache> block_cache_compressed = nullptr;
 
   // Approximate size of user data packed per block.  Note that the
   // block size specified here corresponds to uncompressed data.  The
@@ -297,15 +291,11 @@ struct BlockBasedTableOptions {
   // Same as block_restart_interval but used for the index block.
   int index_block_restart_interval = 1;
 
-  // Block size for partitioned metadata. Currently applied to indexes when
-  // kTwoLevelIndexSearch is used and to filters when partition_filters is used.
-  // Note: Since in the current implementation the filters and index partitions
-  // are aligned, an index/filter block is created when either index or filter
-  // block size reaches the specified limit.
-  // Note: this limit is currently applied to only index blocks; a filter
-  // partition is cut right after an index block is cut
-  // TODO(myabandeh): remove the note above when filter partitions are cut
-  // separately
+  // Target block size for partitioned metadata. Currently applied to indexes
+  // when kTwoLevelIndexSearch is used and to filters when partition_filters is
+  // used. When decouple_partitioned_filters=false (original behavior), there is
+  // much more deviation from this target size. See the comment on
+  // decouple_partitioned_filters.
   uint64_t metadata_block_size = 4096;
 
   // `cache_usage_options` allows users to specify the default
@@ -404,6 +394,23 @@ struct BlockBasedTableOptions {
   // block cache even when cache_index_and_filter_blocks=false.
   bool partition_filters = false;
 
+  // When both partitioned indexes and partitioned filters are enabled,
+  // this enables independent partitioning boundaries between the two. Most
+  // notably, this enables these metadata blocks to hit their target size much
+  // more accurately, as there is often a disparity between index sizes and
+  // filter sizes. This should reduce fragmentation and metadata overheads in
+  // the block cache, as well as treat blocks more fairly for cache eviction
+  // purposes.
+  //
+  // There are no SST format compatibility issues with this option. (All
+  // versions of RocksDB able to read partitioned filters are able to read
+  // decoupled partitioned filters.)
+  //
+  // decouple_partitioned_filters = false is the original behavior, because of
+  // limitations in the initial implementation, and the new behavior
+  // decouple_partitioned_filters = true is expected to become the new default.
+  bool decouple_partitioned_filters = false;
+
   // Option to generate Bloom/Ribbon filters that minimize memory
   // internal fragmentation.
   //
@@ -432,12 +439,12 @@ struct BlockBasedTableOptions {
   // the block cache better at using space it is allowed. (These issues
   // should not arise with partitioned filters.)
   //
-  // NOTE: Do not set to true if you do not trust malloc_usable_size. With
-  // this option, RocksDB might access an allocated memory object beyond its
-  // original size if malloc_usable_size says it is safe to do so. While this
-  // can be considered bad practice, it should not produce undefined behavior
-  // unless malloc_usable_size is buggy or broken.
-  bool optimize_filters_for_memory = false;
+  // NOTE: Set to false if you do not trust malloc_usable_size. When set to
+  // true, RocksDB might access an allocated memory object beyond its original
+  // size if malloc_usable_size says it is safe to do so. While this can be
+  // considered bad practice, it should not produce undefined behavior unless
+  // malloc_usable_size is buggy or broken.
+  bool optimize_filters_for_memory = true;
 
   // Use delta encoding to compress keys in blocks.
   // ReadOptions::pin_data requires this option to be disabled.
@@ -521,7 +528,18 @@ struct BlockBasedTableOptions {
   // 5 -- Can be read by RocksDB's versions since 6.6.0. Full and partitioned
   // filters use a generally faster and more accurate Bloom filter
   // implementation, with a different schema.
-  uint32_t format_version = 5;
+  // 6 -- Modified the file footer and checksum matching so that SST data
+  // misplaced within or between files is as likely to fail checksum
+  // verification as random corruption. Also checksum-protects SST footer.
+  // Can be read by RocksDB versions >= 8.6.0.
+  //
+  // Using the default setting of format_version is strongly recommended, so
+  // that available enhancements are adopted eventually and automatically. The
+  // default setting will only update to the latest after thorough production
+  // validation and sufficient time and number of releases have elapsed
+  // (6 months recommended) to ensure a clean downgrade/revert path for users
+  // who might only upgrade a few times per year.
+  uint32_t format_version = 6;
 
   // Store index blocks on disk in compressed format. Changing this option to
   // false  will avoid the overhead of decompression if index blocks are evicted
@@ -674,13 +692,16 @@ struct BlockBasedTablePropertyNames {
   static const std::string kWholeKeyFiltering;
   // value is "1" for true and "0" for false.
   static const std::string kPrefixFiltering;
+  // Set to "1" when partitioned filters are decoupled from partitioned indexes.
+  // This metadata is recorded in case a read-time optimization for coupled
+  // filter+index partitioning is ever developed; that optimization/assumption
+  // would be disabled when this is set.
+  static const std::string kDecoupledPartitionedFilters;
 };
 
 // Create default block based table factory.
-extern TableFactory* NewBlockBasedTableFactory(
+TableFactory* NewBlockBasedTableFactory(
     const BlockBasedTableOptions& table_options = BlockBasedTableOptions());
-
-#ifndef ROCKSDB_LITE
 
 enum EncodingType : char {
   // Always write full keys without any special encoding.
@@ -709,7 +730,7 @@ struct PlainTablePropertyNames {
 const uint32_t kPlainTableVariableLength = 0;
 
 struct PlainTableOptions {
-  static const char* kName() { return "PlainTableOptions"; };
+  static const char* kName() { return "PlainTableOptions"; }
   // @user_key_len: plain table has optimization for fix-sized keys, which can
   //                be specified via user_key_len.  Alternatively, you can pass
   //                `kPlainTableVariableLength` if your keys have variable
@@ -767,7 +788,7 @@ struct PlainTableOptions {
 // the hash bucket found, a binary search is executed for hash conflicts.
 // Finally, a linear search is used.
 
-extern TableFactory* NewPlainTableFactory(
+TableFactory* NewPlainTableFactory(
     const PlainTableOptions& options = PlainTableOptions());
 
 struct CuckooTablePropertyNames {
@@ -803,7 +824,7 @@ struct CuckooTablePropertyNames {
 };
 
 struct CuckooTableOptions {
-  static const char* kName() { return "CuckooTableOptions"; };
+  static const char* kName() { return "CuckooTableOptions"; }
 
   // Determines the utilization of hash tables. Smaller values
   // result in larger hash tables with fewer collisions.
@@ -834,22 +855,20 @@ struct CuckooTableOptions {
 };
 
 // Cuckoo Table Factory for SST table format using Cache Friendly Cuckoo Hashing
-extern TableFactory* NewCuckooTableFactory(
+TableFactory* NewCuckooTableFactory(
     const CuckooTableOptions& table_options = CuckooTableOptions());
-
-#endif  // ROCKSDB_LITE
 
 class RandomAccessFileReader;
 
 // A base class for table factories.
 class TableFactory : public Customizable {
  public:
-  virtual ~TableFactory() override {}
+  ~TableFactory() override {}
 
-  static const char* kBlockCacheOpts() { return "BlockCache"; };
-  static const char* kBlockBasedTableName() { return "BlockBasedTable"; };
+  static const char* kBlockCacheOpts() { return "BlockCache"; }
+  static const char* kBlockBasedTableName() { return "BlockBasedTable"; }
   static const char* kPlainTableName() { return "PlainTable"; }
-  static const char* kCuckooTableName() { return "CuckooTable"; };
+  static const char* kCuckooTableName() { return "CuckooTable"; }
 
   // Creates and configures a new TableFactory from the input options and id.
   static Status CreateFromString(const ConfigOptions& config_options,
@@ -919,7 +938,6 @@ class TableFactory : public Customizable {
   virtual bool IsDeleteRangeSupported() const { return false; }
 };
 
-#ifndef ROCKSDB_LITE
 // Create a special table factory that can open either of the supported
 // table formats, based on setting inside the SST files. It should be used to
 // convert a DB from one table format to another.
@@ -929,12 +947,10 @@ class TableFactory : public Customizable {
 // @plain_table_factory: plain table factory to use. If NULL, use a default one.
 // @cuckoo_table_factory: cuckoo table factory to use. If NULL, use a default
 // one.
-extern TableFactory* NewAdaptiveTableFactory(
+TableFactory* NewAdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write = nullptr,
     std::shared_ptr<TableFactory> block_based_table_factory = nullptr,
     std::shared_ptr<TableFactory> plain_table_factory = nullptr,
     std::shared_ptr<TableFactory> cuckoo_table_factory = nullptr);
-
-#endif  // ROCKSDB_LITE
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -109,6 +109,12 @@ std::string TableProperties::ToString(const std::string& prop_delim,
   AppendProperty(result, "comparator name",
                  comparator_name.empty() ? std::string("N/A") : comparator_name,
                  prop_delim, kv_delim);
+  AppendProperty(result, "user defined timestamps persisted",
+                 user_defined_timestamps_persisted ? std::string("true")
+                                                   : std::string("false"),
+                 prop_delim, kv_delim);
+  AppendProperty(result, "largest sequence number in file", key_largest_seqno,
+                 prop_delim, kv_delim);
 
   AppendProperty(
       result, "merge operator name",
@@ -159,7 +165,7 @@ std::string TableProperties::ToString(const std::string& prop_delim,
                  kv_delim);
 
   SeqnoToTimeMapping seq_time_mapping;
-  s = seq_time_mapping.Add(seqno_to_time_mapping);
+  s = seq_time_mapping.DecodeFrom(seqno_to_time_mapping);
   AppendProperty(result, "Sequence number to time mapping",
                  s.ok() ? seq_time_mapping.ToHumanString() : "N/A", prop_delim,
                  kv_delim);
@@ -303,6 +309,12 @@ const std::string TablePropertiesNames::kFastCompressionEstimatedDataSize =
     "rocksdb.sample_for_compression.fast.data.size";
 const std::string TablePropertiesNames::kSequenceNumberTimeMapping =
     "rocksdb.seqno.time.map";
+const std::string TablePropertiesNames::kTailStartOffset =
+    "rocksdb.tail.start.offset";
+const std::string TablePropertiesNames::kUserDefinedTimestampsPersisted =
+    "rocksdb.user.defined.timestamps.persisted";
+const std::string TablePropertiesNames::kKeyLargestSeqno =
+    "rocksdb.key.largest.seqno";
 
 #ifndef NDEBUG
 // WARNING: TEST_SetRandomTableProperties assumes the following layout of

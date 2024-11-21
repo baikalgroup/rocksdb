@@ -32,8 +32,18 @@ class BlobFileCache {
   BlobFileCache(const BlobFileCache&) = delete;
   BlobFileCache& operator=(const BlobFileCache&) = delete;
 
-  Status GetBlobFileReader(uint64_t blob_file_number,
+  Status GetBlobFileReader(const ReadOptions& read_options,
+                           uint64_t blob_file_number,
                            CacheHandleGuard<BlobFileReader>* blob_file_reader);
+
+  // Called when a blob file is obsolete to ensure it is removed from the cache
+  // to avoid effectively leaking the open file and assicated memory
+  void Evict(uint64_t blob_file_number);
+
+  // Used to identify cache entries for blob files (not normally useful)
+  static const Cache::CacheItemHelper* GetHelper() {
+    return CacheInterface::GetBasicHelper();
+  }
 
  private:
   using CacheInterface =
@@ -42,7 +52,7 @@ class BlobFileCache {
   CacheInterface cache_;
   // Note: mutex_ below is used to guard against multiple threads racing to open
   // the same file.
-  Striped<port::Mutex, Slice> mutex_;
+  Striped<CacheAlignedWrapper<port::Mutex>> mutex_;
   const ImmutableOptions* immutable_options_;
   const FileOptions* file_options_;
   uint32_t column_family_id_;

@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
 #ifndef GFLAGS
 #include <cstdio>
 int main() {
@@ -493,7 +492,7 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
       ASSERT_EQ(20, ParseDouble(percent));
     }
     ASSERT_EQ(expected_callers.size(), callers.size());
-    for (auto caller : callers) {
+    for (const auto& caller : callers) {
       ASSERT_TRUE(expected_callers.find(caller) != expected_callers.end());
     }
     ASSERT_OK(env_->DeleteFile(percent_access_summary_file));
@@ -505,7 +504,7 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
       std::string caller;
       ASSERT_TRUE(getline(analyzing_callers, caller, ','));
       std::vector<std::string> breakdowns{"level", "bt"};
-      for (auto breakdown : breakdowns) {
+      for (const auto& breakdown : breakdowns) {
         const std::string file_name = test_path_ + "/" + caller + "_" +
                                       breakdown +
                                       "_percentage_of_accesses_summary";
@@ -555,7 +554,7 @@ TEST_F(BlockCacheTracerTest, BlockCacheAnalyzer) {
   }
   for (auto const& access_type : access_types) {
     std::vector<std::string> block_types{"Index", "Data", "Filter"};
-    for (auto block_type : block_types) {
+    for (const auto& block_type : block_types) {
       // Validate reuse block timeline.
       const std::string reuse_blocks_timeline = test_path_ + "/" + block_type +
                                                 "_" + access_type +
@@ -790,11 +789,3 @@ int main(int argc, char** argv) {
   return RUN_ALL_TESTS();
 }
 #endif  // GFLAG
-#else
-#include <stdio.h>
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr,
-          "block_cache_trace_analyzer_test is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-#endif  // ROCKSDB_LITE

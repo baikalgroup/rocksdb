@@ -9,6 +9,7 @@
 
 #ifndef NDEBUG
 
+#include "db/blob/blob_file_cache.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -155,8 +156,10 @@ Status DBImpl::TEST_FlushMemTable(ColumnFamilyData* cfd,
 }
 
 Status DBImpl::TEST_AtomicFlushMemTables(
-    const autovector<ColumnFamilyData*>& cfds, const FlushOptions& flush_opts) {
-  return AtomicFlushMemTables(cfds, flush_opts, FlushReason::kTest);
+    const autovector<ColumnFamilyData*>& provided_candidate_cfds,
+    const FlushOptions& flush_opts) {
+  return AtomicFlushMemTables(flush_opts, FlushReason::kTest,
+                              provided_candidate_cfds);
 }
 
 Status DBImpl::TEST_WaitForBackgroundWork() {
@@ -176,9 +179,12 @@ Status DBImpl::TEST_WaitForFlushMemTable(ColumnFamilyHandle* column_family) {
   return WaitForFlushMemTable(cfd, nullptr, false);
 }
 
-Status DBImpl::TEST_WaitForCompact(bool wait_unscheduled) {
-  // Wait until the compaction completes
-  return WaitForCompact(wait_unscheduled);
+Status DBImpl::TEST_WaitForCompact() {
+  return WaitForCompact(WaitForCompactOptions());
+}
+Status DBImpl::TEST_WaitForCompact(
+    const WaitForCompactOptions& wait_for_compact_options) {
+  return WaitForCompact(wait_for_compact_options);
 }
 
 Status DBImpl::TEST_WaitForPurge() {
@@ -194,18 +200,25 @@ Status DBImpl::TEST_GetBGError() {
   return error_handler_.GetBGError();
 }
 
+bool DBImpl::TEST_IsRecoveryInProgress() {
+  InstrumentedMutexLock l(&mutex_);
+  return error_handler_.IsRecoveryInProgress();
+}
+
 void DBImpl::TEST_LockMutex() { mutex_.Lock(); }
 
 void DBImpl::TEST_UnlockMutex() { mutex_.Unlock(); }
 
+void DBImpl::TEST_SignalAllBgCv() { bg_cv_.SignalAll(); }
+
 void* DBImpl::TEST_BeginWrite() {
   auto w = new WriteThread::Writer();
   write_thread_.EnterUnbatched(w, &mutex_);
-  return reinterpret_cast<void*>(w);
+  return static_cast<void*>(w);
 }
 
 void DBImpl::TEST_EndWrite(void* w) {
-  auto writer = reinterpret_cast<WriteThread::Writer*>(w);
+  auto writer = static_cast<WriteThread::Writer*>(w);
   write_thread_.ExitUnbatched(writer);
   delete writer;
 }
@@ -289,7 +302,6 @@ size_t DBImpl::TEST_GetWalPreallocateBlockSize(
   return GetWalPreallocateBlockSize(write_buffer_size);
 }
 
-#ifndef ROCKSDB_LITE
 void DBImpl::TEST_WaitForPeriodicTaskRun(std::function<void()> callback) const {
   periodic_task_scheduler_.TEST_WaitForRun(callback);
 }
@@ -300,13 +312,66 @@ const PeriodicTaskScheduler& DBImpl::TEST_GetPeriodicTaskScheduler() const {
 
 SeqnoToTimeMapping DBImpl::TEST_GetSeqnoToTimeMapping() const {
   InstrumentedMutexLock l(&mutex_);
-  return seqno_time_mapping_;
+  return seqno_to_time_mapping_;
 }
 
-#endif  // !ROCKSDB_LITE
+const autovector<uint64_t>& DBImpl::TEST_GetFilesToQuarantine() const {
+  InstrumentedMutexLock l(&mutex_);
+  return error_handler_.GetFilesToQuarantine();
+}
+
+void DBImpl::TEST_DeleteObsoleteFiles() {
+  InstrumentedMutexLock l(&mutex_);
+  DeleteObsoleteFiles();
+}
 
 size_t DBImpl::TEST_EstimateInMemoryStatsHistorySize() const {
+  InstrumentedMutexLock l(&const_cast<DBImpl*>(this)->stats_history_mutex_);
   return EstimateInMemoryStatsHistorySize();
+}
+
+void DBImpl::TEST_VerifyNoObsoleteFilesCached(
+    bool db_mutex_already_held) const {
+  // This check is somewhat expensive and obscure to make a part of every
+  // unit test in every build variety. Thus, we only enable it for ASAN builds.
+  if (!kMustFreeHeapAllocations) {
+    return;
+  }
+
+  std::optional<InstrumentedMutexLock> l;
+  if (db_mutex_already_held) {
+    mutex_.AssertHeld();
+  } else {
+    l.emplace(&mutex_);
+  }
+
+  std::vector<uint64_t> live_files;
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    // Sneakily add both SST and blob files to the same list
+    cfd->current()->AddLiveFiles(&live_files, &live_files);
+  }
+  std::sort(live_files.begin(), live_files.end());
+
+  auto fn = [&live_files](const Slice& key, Cache::ObjectPtr, size_t,
+                          const Cache::CacheItemHelper* helper) {
+    if (helper != BlobFileCache::GetHelper()) {
+      // Skip non-blob files for now
+      // FIXME: diagnose and fix the leaks of obsolete SST files revealed in
+      // unit tests.
+      return;
+    }
+    // See TableCache and BlobFileCache
+    assert(key.size() == sizeof(uint64_t));
+    uint64_t file_number;
+    GetUnaligned(reinterpret_cast<const uint64_t*>(key.data()), &file_number);
+    // Assert file is in sorted live_files
+    assert(
+        std::binary_search(live_files.begin(), live_files.end(), file_number));
+  };
+  table_cache_->ApplyToAllEntries(fn, {});
 }
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // NDEBUG

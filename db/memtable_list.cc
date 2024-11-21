@@ -181,10 +181,11 @@ bool MemTableListVersion::GetFromList(
     }
 
     if (done) {
-      assert(*seq != kMaxSequenceNumber || s->IsNotFound());
+      assert(*seq != kMaxSequenceNumber ||
+             (!s->ok() && !s->IsMergeInProgress()));
       return true;
     }
-    if (!done && !s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
+    if (!s->ok() && !s->IsMergeInProgress() && !s->IsNotFound()) {
       return false;
     }
   }
@@ -211,18 +212,25 @@ Status MemTableListVersion::AddRangeTombstoneIterators(
 }
 
 void MemTableListVersion::AddIterators(
-    const ReadOptions& options, std::vector<InternalIterator*>* iterator_list,
-    Arena* arena) {
+    const ReadOptions& options,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
+    const SliceTransform* prefix_extractor,
+    std::vector<InternalIterator*>* iterator_list, Arena* arena) {
   for (auto& m : memlist_) {
-    iterator_list->push_back(m->NewIterator(options, arena));
+    iterator_list->push_back(m->NewIterator(options, seqno_to_time_mapping,
+                                            arena, prefix_extractor));
   }
 }
 
-void MemTableListVersion::AddIterators(const ReadOptions& options,
-                                       MergeIteratorBuilder* merge_iter_builder,
-                                       bool add_range_tombstone_iter) {
+void MemTableListVersion::AddIterators(
+    const ReadOptions& options,
+    UnownedPtr<const SeqnoToTimeMapping> seqno_to_time_mapping,
+    const SliceTransform* prefix_extractor,
+    MergeIteratorBuilder* merge_iter_builder, bool add_range_tombstone_iter) {
   for (auto& m : memlist_) {
-    auto mem_iter = m->NewIterator(options, merge_iter_builder->GetArena());
+    auto mem_iter =
+        m->NewIterator(options, seqno_to_time_mapping,
+                       merge_iter_builder->GetArena(), prefix_extractor);
     if (!add_range_tombstone_iter || options.ignore_range_deletions) {
       merge_iter_builder->AddIterator(mem_iter);
     } else {
@@ -231,19 +239,19 @@ void MemTableListVersion::AddIterators(const ReadOptions& options,
       SequenceNumber read_seq = options.snapshot != nullptr
                                     ? options.snapshot->GetSequenceNumber()
                                     : kMaxSequenceNumber;
-      TruncatedRangeDelIterator* mem_tombstone_iter = nullptr;
+      std::unique_ptr<TruncatedRangeDelIterator> mem_tombstone_iter;
       auto range_del_iter = m->NewRangeTombstoneIterator(
           options, read_seq, true /* immutale_memtable */);
       if (range_del_iter == nullptr || range_del_iter->empty()) {
         delete range_del_iter;
       } else {
-        mem_tombstone_iter = new TruncatedRangeDelIterator(
+        mem_tombstone_iter = std::make_unique<TruncatedRangeDelIterator>(
             std::unique_ptr<FragmentedRangeTombstoneIterator>(range_del_iter),
             &m->GetInternalKeyComparator(), nullptr /* smallest */,
             nullptr /* largest */);
       }
-      merge_iter_builder->AddPointAndTombstoneIterator(mem_iter,
-                                                       mem_tombstone_iter);
+      merge_iter_builder->AddPointAndTombstoneIterator(
+          mem_iter, std::move(mem_tombstone_iter));
     }
   }
 }
@@ -434,23 +442,57 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
 }
 
 void MemTableList::RollbackMemtableFlush(const autovector<MemTable*>& mems,
-                                         uint64_t /*file_number*/) {
+                                         bool rollback_succeeding_memtables) {
+  TEST_SYNC_POINT("RollbackMemtableFlush");
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_MEMTABLE_ROLLBACK);
-  assert(!mems.empty());
-
-  // If the flush was not successful, then just reset state.
-  // Maybe a succeeding attempt to flush will be successful.
+#ifndef NDEBUG
   for (MemTable* m : mems) {
     assert(m->flush_in_progress_);
     assert(m->file_number_ == 0);
-
-    m->flush_in_progress_ = false;
-    m->flush_completed_ = false;
-    m->edit_.Clear();
-    num_flush_not_started_++;
   }
-  imm_flush_needed.store(true, std::memory_order_release);
+#endif
+
+  if (rollback_succeeding_memtables && !mems.empty()) {
+    std::list<MemTable*>& memlist = current_->memlist_;
+    auto it = memlist.rbegin();
+    for (; *it != mems[0] && it != memlist.rend(); ++it) {
+    }
+    // mems should be in memlist
+    assert(*it == mems[0]);
+    if (*it == mems[0]) {
+      ++it;
+    }
+    while (it != memlist.rend()) {
+      MemTable* m = *it;
+      // Only rollback complete, not in-progress,
+      // in_progress can be flushes that are still writing SSTs
+      if (m->flush_completed_) {
+        m->flush_in_progress_ = false;
+        m->flush_completed_ = false;
+        m->edit_.Clear();
+        m->file_number_ = 0;
+        num_flush_not_started_++;
+        ++it;
+      } else {
+        break;
+      }
+    }
+  }
+
+  for (MemTable* m : mems) {
+    if (m->flush_in_progress_) {
+      assert(m->file_number_ == 0);
+      m->file_number_ = 0;
+      m->flush_in_progress_ = false;
+      m->flush_completed_ = false;
+      m->edit_.Clear();
+      num_flush_not_started_++;
+    }
+  }
+  if (!mems.empty()) {
+    imm_flush_needed.store(true, std::memory_order_release);
+  }
 }
 
 // Try record a successful flush in the manifest file. It might just return
@@ -466,6 +508,9 @@ Status MemTableList::TryInstallMemtableFlushResults(
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS);
   mu->AssertHeld();
+
+  const ReadOptions read_options(Env::IOActivity::kFlush);
+  const WriteOptions write_options(Env::IOActivity::kFlush);
 
   // Flush was successful
   // Record the status on the memtable object. Either this call or a call by a
@@ -517,11 +562,12 @@ Status MemTableList::TryInstallMemtableFlushResults(
         batch_file_number = m->file_number_;
         if (m->edit_.GetBlobFileAdditions().empty()) {
           ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64 " started",
+                           "[%s] Level-0 commit flush result of table #%" PRIu64
+                           " started",
                            cfd->GetName().c_str(), m->file_number_);
         } else {
           ROCKS_LOG_BUFFER(log_buffer,
-                           "[%s] Level-0 commit table #%" PRIu64
+                           "[%s] Level-0 commit flush result of table #%" PRIu64
                            " (+%zu blob files) started",
                            cfd->GetName().c_str(), m->file_number_,
                            m->edit_.GetBlobFileAdditions().size());
@@ -529,51 +575,38 @@ Status MemTableList::TryInstallMemtableFlushResults(
 
         edit_list.push_back(&m->edit_);
         memtables_to_flush.push_back(m);
-#ifndef ROCKSDB_LITE
         std::unique_ptr<FlushJobInfo> info = m->ReleaseFlushJobInfo();
         if (info != nullptr) {
           committed_flush_jobs_info->push_back(std::move(info));
         }
-#else
-        (void)committed_flush_jobs_info;
-#endif  // !ROCKSDB_LITE
       }
       batch_count++;
     }
 
     // TODO(myabandeh): Not sure how batch_count could be 0 here.
     if (batch_count > 0) {
-      uint64_t min_wal_number_to_keep = 0;
-      assert(edit_list.size() > 0);
-      if (vset->db_options()->allow_2pc) {
-        // Note that if mempurge is successful, the edit_list will
-        // not be applicable (contains info of new min_log number to keep,
-        // and level 0 file path of SST file created during normal flush,
-        // so both pieces of information are irrelevant after a successful
-        // mempurge operation).
-        min_wal_number_to_keep = PrecomputeMinLogNumberToKeep2PC(
-            vset, *cfd, edit_list, memtables_to_flush, prep_tracker);
-
-        // We piggyback the information of earliest log file to keep in the
-        // manifest entry for the last file flushed.
+      VersionEdit edit;
+#ifdef ROCKSDB_ASSERT_STATUS_CHECKED
+      if (memtables_to_flush.size() == memlist.size()) {
+        // TODO(yuzhangyu): remove this testing code once the
+        // `GetEditForDroppingCurrentVersion` API is used by the atomic data
+        // replacement. This function can get the same edits for wal related
+        // fields, and some duplicated fields as contained already in edit_list
+        // for column family's recovery.
+        edit = GetEditForDroppingCurrentVersion(cfd, vset, prep_tracker);
       } else {
-        min_wal_number_to_keep =
-            PrecomputeMinLogNumberToKeepNon2PC(vset, *cfd, edit_list);
+        edit = GetDBRecoveryEditForObsoletingMemTables(
+            vset, *cfd, edit_list, memtables_to_flush, prep_tracker);
       }
-
-      VersionEdit wal_deletion;
-      wal_deletion.SetMinLogNumberToKeep(min_wal_number_to_keep);
-      if (vset->db_options()->track_and_verify_wals_in_manifest) {
-        if (min_wal_number_to_keep >
-            vset->GetWalSet().GetMinWalNumberToKeep()) {
-          wal_deletion.DeleteWalsBefore(min_wal_number_to_keep);
-        }
-        TEST_SYNC_POINT_CALLBACK(
-            "MemTableList::TryInstallMemtableFlushResults:"
-            "AfterComputeMinWalToKeep",
-            nullptr);
-      }
-      edit_list.push_back(&wal_deletion);
+#else
+      edit = GetDBRecoveryEditForObsoletingMemTables(
+          vset, *cfd, edit_list, memtables_to_flush, prep_tracker);
+#endif  // ROCKSDB_ASSERT_STATUS_CHECKED
+      TEST_SYNC_POINT_CALLBACK(
+          "MemTableList::TryInstallMemtableFlushResults:"
+          "AfterComputeMinWalToKeep",
+          nullptr);
+      edit_list.push_back(&edit);
 
       const auto manifest_write_cb = [this, cfd, batch_count, log_buffer,
                                       to_delete, mu](const Status& status) {
@@ -582,10 +615,10 @@ Status MemTableList::TryInstallMemtableFlushResults(
       };
       if (write_edits) {
         // this can release and reacquire the mutex.
-        s = vset->LogAndApply(cfd, mutable_cf_options, edit_list, mu,
-                              db_directory, /*new_descriptor_log=*/false,
-                              /*column_family_options=*/nullptr,
-                              manifest_write_cb);
+        s = vset->LogAndApply(
+            cfd, mutable_cf_options, read_options, write_options, edit_list, mu,
+            db_directory, /*new_descriptor_log=*/false,
+            /*column_family_options=*/nullptr, manifest_write_cb);
       } else {
         // If write_edit is false (e.g: successful mempurge),
         // then remove old memtables, wake up manifest write queue threads,
@@ -720,12 +753,12 @@ void MemTableList::RemoveMemTablesOrRestoreFlags(
       MemTable* m = current_->memlist_.back();
       if (m->edit_.GetBlobFileAdditions().empty()) {
         ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] Level-0 commit table #%" PRIu64
+                         "[%s] Level-0 commit flush result of table #%" PRIu64
                          ": memtable #%" PRIu64 " done",
                          cfd->GetName().c_str(), m->file_number_, mem_id);
       } else {
         ROCKS_LOG_BUFFER(log_buffer,
-                         "[%s] Level-0 commit table #%" PRIu64
+                         "[%s] Level-0 commit flush result of table #%" PRIu64
                          " (+%zu blob files)"
                          ": memtable #%" PRIu64 " done",
                          cfd->GetName().c_str(), m->file_number_,
@@ -802,6 +835,9 @@ Status InstallMemtableAtomicFlushResults(
       ThreadStatus::STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS);
   mu->AssertHeld();
 
+  const ReadOptions read_options(Env::IOActivity::kFlush);
+  const WriteOptions write_options(Env::IOActivity::kFlush);
+
   size_t num = mems_list.size();
   assert(cfds.size() == num);
   if (imm_lists != nullptr) {
@@ -825,7 +861,6 @@ Status InstallMemtableAtomicFlushResults(
       (*mems_list[k])[i]->SetFlushCompleted(true);
       (*mems_list[k])[i]->SetFileNumber(file_metas[k]->fd.GetNumber());
     }
-#ifndef ROCKSDB_LITE
     if (committed_flush_jobs_info[k]) {
       assert(!mems_list[k]->empty());
       assert((*mems_list[k])[0]);
@@ -833,9 +868,6 @@ Status InstallMemtableAtomicFlushResults(
           (*mems_list[k])[0]->ReleaseFlushJobInfo();
       committed_flush_jobs_info[k]->push_back(std::move(flush_job_info));
     }
-#else   //! ROCKSDB_LITE
-    (void)committed_flush_jobs_info;
-#endif  // ROCKSDB_LITE
   }
 
   Status s;
@@ -883,8 +915,8 @@ Status InstallMemtableAtomicFlushResults(
   }
 
   // this can release and reacquire the mutex.
-  s = vset->LogAndApply(cfds, mutable_cf_options_list, edit_lists, mu,
-                        db_directory);
+  s = vset->LogAndApply(cfds, mutable_cf_options_list, read_options,
+                        write_options, edit_lists, mu, db_directory);
 
   for (size_t k = 0; k != cfds.size(); ++k) {
     auto* imm = (imm_lists == nullptr) ? cfds[k]->imm() : imm_lists->at(k);
@@ -986,6 +1018,40 @@ void MemTableList::RemoveOldMemTables(uint64_t log_number,
 
   UpdateCachedValuesFromMemTableListVersion();
   ResetTrimHistoryNeeded();
+}
+
+VersionEdit MemTableList::GetEditForDroppingCurrentVersion(
+    const ColumnFamilyData* cfd, VersionSet* vset,
+    LogsWithPrepTracker* prep_tracker) const {
+  assert(cfd);
+  auto& memlist = current_->memlist_;
+  if (memlist.empty()) {
+    return VersionEdit();
+  }
+
+  uint64_t max_next_log_number = 0;
+  autovector<VersionEdit*> edit_list;
+  autovector<MemTable*> memtables_to_drop;
+  for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
+    MemTable* m = *it;
+    memtables_to_drop.push_back(m);
+    max_next_log_number = std::max(m->GetNextLogNumber(), max_next_log_number);
+  }
+
+  // Check the obsoleted MemTables' impact on WALs related to DB's recovery (min
+  // log number to keep, a delta of WAL files to delete).
+  VersionEdit edit_with_log_number;
+  edit_with_log_number.SetPrevLogNumber(0);
+  edit_with_log_number.SetLogNumber(max_next_log_number);
+  edit_list.push_back(&edit_with_log_number);
+  VersionEdit edit = GetDBRecoveryEditForObsoletingMemTables(
+      vset, *cfd, edit_list, memtables_to_drop, prep_tracker);
+
+  // Set fields related to the column family's recovery.
+  edit.SetColumnFamily(cfd->GetID());
+  edit.SetPrevLogNumber(0);
+  edit.SetLogNumber(max_next_log_number);
+  return edit;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
