@@ -37,7 +37,7 @@ CXXFLAGS('-std=c++17 -g -ggdb -pipe -W -fPIC -msse -msse4.2 -mpclmul -Wall -fno-
 INCPATHS('. ./include ./third-party/gtest-1.7.0/fused-src ./third-party/fbson')
 
 #link flags
-LDFLAGS('-lpthread -lrt -lz ')
+LDFLAGS('-lpthread -lrt -lz -ldl')
 
 CONFIGS("baidu/third-party/jemalloc@jemalloc_V5.2.0.2_GCC820_6U3_K3_GEN_PD_BL@git_tag")
 CONFIGS('thirdsrc/snappy@snappy_1-0-5-100_PD_BL')
@@ -45,7 +45,7 @@ CONFIGS('baidu/third-party/gflags@gflags_V2.2.2_GCC12_GEN_PD_BL')
 CONFIGS("baidu/third-party/bzip2@1.0.8@git_branch")
 CONFIGS("baidu/third-party/zstd@zstd_V1.4.4.1_GCC820_6U3_K2_GEN_PD_BL@git_branch")   
 CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@git_tag")
-
+CONFIGS('baidu/base/common@stable')
 LIB_SOURCES="""
   cache/cache.cc
   cache/cache_entry_roles.cc
@@ -377,6 +377,28 @@ LIB_SOURCES="""
 #release headers
 HEADERS('include/rocksdb/*.h', '$INC/rocksdb')
 HEADERS('include/rocksdb/utilities/*.h', '$INC/rocksdb/utilities')
+HEADERS('db/compaction/*.h', '$INC/db/compaction')
+HEADERS('db/blob/*.h', '$INC/db/blob')
+HEADERS('db/wide/*.h', '$INC/db/wide')
+HEADERS('db/*.h', '$INC/db')
+HEADERS('monitoring/*.h', '$INC/monitoring')
+HEADERS('port/*.h', '$INC/port')
+HEADERS('util/*.h', '$INC/util')
+HEADERS('options/*.h', '$INC/options')
+HEADERS('cache/*.h', '$INC/cache')
+HEADERS('table/*.h', '$INC/table')
+HEADERS('table/block_based/*.h', '$INC/table/block_based')
+HEADERS('table/adaptive/*.h', '$INC/table/blocadaptivek_based')
+HEADERS('table/cuckoo/*.h', '$INC/table/cuckoo')
+HEADERS('table/plain/*.h', '$INC/table/plain')
+HEADERS('file/*.h', '$INC/file')
+HEADERS('env/*.h', '$INC/env')
+HEADERS('trace_replay/*.h', '$INC/trace_replay')
+HEADERS('memory/*.h', '$INC/memory')
+HEADERS('test_util/*.h', '$INC/test_util')
+HEADERS('logging/*.h', '$INC/logging')
+HEADERS('tools/*.h', '$INC/tools')
+
 #.a
 StaticLibrary('rocksdb', Sources(LIB_SOURCES))
 #StaticLibrary('rocksdb', PreBuilt(True))
@@ -384,3 +406,4 @@ StaticLibrary('rocksdb', Sources(LIB_SOURCES))
 #.so
 SharedLibrary('rocksdb', Sources(LIB_SOURCES))
 #SharedLibrary('rocksdb', PreBuilt(True))
+
