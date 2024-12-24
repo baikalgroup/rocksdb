@@ -2347,6 +2347,7 @@ struct CompactionServiceOptionsOverride {
   // collector.
   std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
       table_properties_collector_factories;
+  int max_open_files = -1;
 };
 
 struct OpenAndCompactOptions {
