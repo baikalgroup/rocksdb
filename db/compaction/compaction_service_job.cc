@@ -33,13 +33,18 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
 
   const std::vector<CompactionInputFiles>& inputs =
       *(compact_->compaction->inputs());
+  bool is_l0_compaction = true;
   for (const auto& files_per_level : inputs) {
+    if (files_per_level.level != 0) {
+      is_l0_compaction = false;
+    }
     for (const auto& file : files_per_level.files) {
       compaction_input.input_files.emplace_back(
           MakeTableFileName(file->fd.GetNumber()));
     }
   }
 
+  compaction_input.is_l0_compaction = is_l0_compaction;
   compaction_input.cf_name = compaction->column_family_data()->GetName();
   compaction_input.snapshots = existing_snapshots_;
   compaction_input.has_begin = sub_compact->start.has_value();
