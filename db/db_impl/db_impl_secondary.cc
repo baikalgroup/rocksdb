@@ -138,6 +138,27 @@ Status DBImplSecondary::FindNewLogNumbers(std::vector<uint64_t>* logs) {
   return s;
 }
 
+class TimeCost {
+public:
+    TimeCost() {
+        _start = base::gettimeofday_us();
+    }
+
+    ~TimeCost() {}
+
+    void reset() {
+        _start = base::gettimeofday_us();
+    }
+
+    int64_t get_time() const {
+        return base::gettimeofday_us() - _start;
+    }
+
+private:
+    int64_t _start;
+};
+
+
 Status DBImplSecondary::MaybeInitLogReader(
     uint64_t log_number, log::FragmentBufferedReader** log_reader) {
   auto iter = log_readers_.find(log_number);
@@ -1004,6 +1025,7 @@ Status DB::OpenAndCompact(
       column_families.emplace_back(cf);
     }
   }
+  TimeCost cost;
   // 5. Open db As Secondary
   DB* db;
   std::vector<ColumnFamilyHandle*> handles;
@@ -1013,6 +1035,8 @@ Status DB::OpenAndCompact(
     return s;
   }
   assert(db);
+  int64_t open_as_secondary_tm = cost.get_time();
+
   // 6. Find the handle of the Column Family that this will compact
   ColumnFamilyHandle* cfh = nullptr;
   for (auto* handle : handles) {
@@ -1022,13 +1046,25 @@ Status DB::OpenAndCompact(
     }
   }
   assert(cfh);
-
+  cost.reset();
   // 7. Run the compaction without installation.
   // Output will be stored in the directory specified by output_directory
   CompactionServiceResult compaction_result;
   DBImplSecondary* db_secondary = static_cast_with_check<DBImplSecondary>(db);
   s = db_secondary->CompactWithoutInstallation(options, cfh, compaction_input,
                                                &compaction_result);
+    int64_t compact_without_install_tm = cost.get_time();
+    std::string filename = "./log/remote_compaction.log";
+    std::ofstream outfile;
+
+    outfile.open(filename, std::ios::app);
+    if (outfile.is_open()) {
+        outfile << "output_directory: " << output_directory 
+                << ", OpenAsSecondary tm: " << open_as_secondary_tm
+                << ", CompactWithoutInstallation tm: " << compact_without_install_tm << "\n";
+
+        outfile.close(); 
+    }
   // 8. Serialize the result
   Status serialization_status = compaction_result.Write(output);
 
