@@ -44,7 +44,6 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     }
   }
 
-  compaction_input.is_l0_compaction = is_l0_compaction;
   compaction_input.cf_name = compaction->column_family_data()->GetName();
   compaction_input.snapshots = existing_snapshots_;
   compaction_input.has_begin = sub_compact->start.has_value();
@@ -85,7 +84,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       dbname_, db_id_, db_session_id_, GetCompactionId(sub_compact),
       thread_pri_, compaction->compaction_reason(),
       compaction->is_full_compaction(), compaction->is_manual_compaction(),
-      compaction->bottommost_level());
+      compaction->bottommost_level(), is_l0_compaction);
   CompactionServiceScheduleResponse response =
       db_options_.compaction_service->Schedule(info, compaction_input_binary);
   switch (response.status) {

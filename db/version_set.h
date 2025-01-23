@@ -1189,6 +1189,14 @@ class VersionSet {
 
   virtual Status Close(FSDirectory* db_dir, InstrumentedMutex* mu);
 
+  void set_remote_compaction_id(const std::string& remote_compaction_id) {
+    remote_compaction_id_ = remote_compaction_id;
+  }
+
+   const std::string& get_remote_compaction_id() {
+    return remote_compaction_id_;
+  }
+
   Status LogAndApplyToDefaultColumnFamily(
       const ReadOptions& read_options, const WriteOptions& write_options,
       VersionEdit* edit, InstrumentedMutex* mu,
@@ -1714,7 +1722,7 @@ class VersionSet {
 
   // Pointer to the DB's ErrorHandler.
   ErrorHandler* const error_handler_;
-
+  std::string remote_compaction_id_;
  private:
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,

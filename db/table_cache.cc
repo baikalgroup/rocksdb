@@ -95,7 +95,8 @@ Status TableCache::GetTableReader(
     std::unique_ptr<TableReader>* table_reader,
     const std::shared_ptr<const SliceTransform>& prefix_extractor,
     bool skip_filters, int level, bool prefetch_index_and_filter_in_cache,
-    size_t max_file_size_for_l0_meta_pin, Temperature file_temperature) {
+    size_t max_file_size_for_l0_meta_pin, Temperature file_temperature,
+    const std::string& remote_compaction_id) {
   std::string fname = TableFileName(
       ioptions_.cf_paths, file_meta.fd.GetNumber(), file_meta.fd.GetPathId());
   std::unique_ptr<FSRandomAccessFile> file;
@@ -155,7 +156,7 @@ Status TableCache::GetTableReader(
             max_file_size_for_l0_meta_pin, db_session_id_,
             file_meta.fd.GetNumber(), expected_unique_id,
             file_meta.fd.largest_seqno, file_meta.tail_size,
-            file_meta.user_defined_timestamps_persisted),
+            file_meta.user_defined_timestamps_persisted, remote_compaction_id),
         std::move(file_reader), file_meta.fd.GetFileSize(), table_reader,
         prefetch_index_and_filter_in_cache);
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
@@ -177,7 +178,8 @@ Status TableCache::FindTable(
     const std::shared_ptr<const SliceTransform>& prefix_extractor,
     const bool no_io, HistogramImpl* file_read_hist, bool skip_filters,
     int level, bool prefetch_index_and_filter_in_cache,
-    size_t max_file_size_for_l0_meta_pin, Temperature file_temperature) {
+    size_t max_file_size_for_l0_meta_pin, Temperature file_temperature,
+    const std::string& remote_compaction_id) {
   PERF_TIMER_GUARD_WITH_CLOCK(find_table_nanos, ioptions_.clock);
   uint64_t number = file_meta.fd.GetNumber();
   // NOTE: sharing same Cache with BlobFileCache
@@ -203,7 +205,8 @@ Status TableCache::FindTable(
                               block_protection_bytes_per_key, file_read_hist,
                               &table_reader, prefix_extractor, skip_filters,
                               level, prefetch_index_and_filter_in_cache,
-                              max_file_size_for_l0_meta_pin, file_temperature);
+                              max_file_size_for_l0_meta_pin, file_temperature,
+                              remote_compaction_id);
     if (!s.ok()) {
       assert(table_reader == nullptr);
       RecordTick(ioptions_.stats, NO_FILE_ERRORS);
@@ -245,12 +248,17 @@ InternalIterator* TableCache::NewIterator(
   auto& fd = file_meta.fd;
   table_reader = fd.table_reader;
   if (table_reader == nullptr) {
+    std::string filename = "./log/remote_compaction.log";
+    std::ofstream outfile;
+    outfile.open(filename, std::ios::app);
+    outfile << "TableCache::NewIterator: " << std::endl;
+    outfile.close();
     s = FindTable(options, file_options, icomparator, file_meta, &handle,
                   block_protection_bytes_per_key, prefix_extractor,
                   options.read_tier == kBlockCacheTier /* no_io */,
                   file_read_hist, skip_filters, level,
                   true /* prefetch_index_and_filter_in_cache */,
-                  max_file_size_for_l0_meta_pin, file_meta.temperature);
+                  max_file_size_for_l0_meta_pin, file_meta.temperature, "xuzhenjie");
     if (s.ok()) {
       table_reader = cache_.Value(handle);
     }

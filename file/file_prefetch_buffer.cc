@@ -19,6 +19,7 @@
 #include "test_util/sync_point.h"
 #include "util/random.h"
 #include "util/rate_limiter_impl.h"
+#include<iostream>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -160,11 +161,26 @@ Status FilePrefetchBuffer::Prefetch(const IOOptions& opts,
   size_t alignment = reader->file()->GetRequiredBufferAlignment();
   uint64_t rounddown_offset = offset, roundup_end = 0, aligned_useful_len = 0;
   size_t read_len = 0;
-
   ReadAheadSizeTuning(buf, /*read_curr_block=*/true,
                       /*refit_tail=*/true, rounddown_offset, alignment, 0, n,
                       rounddown_offset, roundup_end, read_len,
                       aligned_useful_len);
+
+    {
+        std::string filename = "./log/remote_compaction.log";
+        std::ofstream outfile;
+        outfile.open(filename, std::ios::app);
+        if (outfile.is_open()) {
+            outfile << "Prefetch file_name" << reader->file_name() 
+                    << " rounddown_offset: " << rounddown_offset
+                    << " roundup_end: " << roundup_end
+                    << " n: " << n
+                    << " alignment:" << alignment
+                    << " read_len: " << read_len
+                    << " aligned_useful_len: " << aligned_useful_len << std::endl;
+            outfile.close();
+        }
+    }
 
   Status s;
   if (read_len > 0) {
@@ -654,7 +670,17 @@ Status FilePrefetchBuffer::PrefetchInternal(const IOOptions& opts,
   }
 
   if (read_len1 > 0) {
+    std::string filename = "./log/remote_compaction.log";
+    std::ofstream outfile;
+    outfile.open(filename, std::ios::app);
+    if (outfile.is_open()) {
+        outfile << "Prefetch Read " << read_len1 << " bytes from file." << std::endl;
+    }
     s = Read(buf, opts, reader, read_len1, aligned_useful_len1, start_offset1);
+    if (outfile.is_open()) {
+        outfile << "Prefetch Read end" << std::endl;
+        outfile.close();
+    }
     if (!s.ok()) {
       AbortAllIOs();
       FreeAllBuffers();

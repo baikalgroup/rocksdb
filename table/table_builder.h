@@ -43,7 +43,8 @@ struct TableReaderOptions {
       size_t _max_file_size_for_l0_meta_pin = 0,
       const std::string& _cur_db_session_id = "", uint64_t _cur_file_num = 0,
       UniqueId64x2 _unique_id = {}, SequenceNumber _largest_seqno = 0,
-      uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true)
+      uint64_t _tail_size = 0, bool _user_defined_timestamps_persisted = true,
+      const std::string& _remote_compaction_id = "")
       : ioptions(_ioptions),
         prefix_extractor(_prefix_extractor),
         env_options(_env_options),
@@ -60,7 +61,8 @@ struct TableReaderOptions {
         unique_id(_unique_id),
         block_protection_bytes_per_key(_block_protection_bytes_per_key),
         tail_size(_tail_size),
-        user_defined_timestamps_persisted(_user_defined_timestamps_persisted) {}
+        user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
+        remote_compaction_id(_remote_compaction_id) {}
 
   const ImmutableOptions& ioptions;
   const std::shared_ptr<const SliceTransform>& prefix_extractor;
@@ -97,6 +99,8 @@ struct TableReaderOptions {
 
   // Whether the key in the table contains user-defined timestamps.
   bool user_defined_timestamps_persisted;
+
+  std::string remote_compaction_id;
 };
 
 struct TableBuilderOptions : public TablePropertiesCollectorFactory::Context {

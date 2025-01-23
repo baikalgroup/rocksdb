@@ -1,0 +1,14 @@
+===DumpCollectedConfigs===
++---baidu/third-party/rocksdb@9-7-x-baidu-ebiz-cpdinf@bcloud
+|    \---baidu/third-party/jemalloc@jemalloc_V5.2.0.2_GCC820_6U3_K3_GEN_PD_BL@bcloud
+|    \---thirdsrc/snappy@snappy_1-0-5-100_PD_BL@snappy_1-0-5-100_PD_BL
+|    \---baidu/third-party/gflags@gflags_V2.2.2_GCC12_GEN_PD_BL@gflags_V2.2.2_GCC12_GEN_PD_BL
+|    \---baidu/third-party/bzip2@1.0.8@bcloud
+|    \---baidu/third-party/zstd@zstd_V1.4.4.1_GCC820_6U3_K2_GEN_PD_BL@bcloud
+|    \---baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@bcloud
+|    +---baidu/base/common@stable@bcloud
+|    |    \---baidu/base/ullib@stable@bcloud
+|    |    \---baidu/third-party/gflags@gflags_2-0-0-100_PD_BL@gflags_2-0-0-100_PD_BL
+|    |    \---baidu/third-party/boost@boost_1-56-0-100_PD_BL@boost_1-56-0-100_PD_BL
+|    |    \---baidu/third-party/protobuf@protobuf_2-4-1-1100_PD_BL@protobuf_2-4-1-1100_PD_BL
+|    |    \---baidu/third-party/libevent@libevent_2-0-22-0_PD_BL@libevent_2-0-22-0_PD_BL

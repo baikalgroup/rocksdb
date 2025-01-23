@@ -41,6 +41,12 @@ Status DBImplSecondary::Recover(
     RecoveryContext* /*recovery_ctx*/, bool* /*can_retry*/) {
   mutex_.AssertHeld();
 
+  std::string filename = "./log/remote_compaction.log";
+  std::ofstream outfile;
+  outfile.open(filename, std::ios::app);
+  outfile << "DBImplSecondary::Recover " << static_cast<ReactiveVersionSet*>(versions_.get())->get_remote_compaction_id() << std::endl;
+  outfile.close();
+
   JobContext job_context(0);
   Status s;
   s = static_cast<ReactiveVersionSet*>(versions_.get())
@@ -784,7 +790,8 @@ Status DB::OpenAsSecondary(
     const DBOptions& db_options, const std::string& dbname,
     const std::string& secondary_path,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
+    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr, 
+    const std::string& remote_compaction_id) {
   *dbptr = nullptr;
 
   DBOptions tmp_opts(db_options);
@@ -826,6 +833,18 @@ Status DB::OpenAsSecondary(
   impl->column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(impl->versions_->GetColumnFamilySet()));
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
+
+  size_t pos = secondary_path.rfind('/');
+  if (pos != std::string::npos) {
+      std::string remote_compaction_id = secondary_path.substr(pos + 1);
+      impl->versions_->set_remote_compaction_id(remote_compaction_id);
+  }
+
+  std::string filename = "./log/remote_compaction.log";
+  std::ofstream outfile;
+  outfile.open(filename, std::ios::app);
+  outfile << "OpenAsSecondary " << impl->versions_->get_remote_compaction_id() << std::endl;
+  outfile.close();
 
   impl->mutex_.Lock();
   s = impl->Recover(column_families, true, false, false);

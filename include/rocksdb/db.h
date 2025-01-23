@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <set>
 
 #include "rocksdb/attribute_groups.h"
 #include "rocksdb/block_cache_trace_writer.h"
@@ -297,7 +298,8 @@ class DB {
       const DBOptions& db_options, const std::string& name,
       const std::string& secondary_path,
       const std::vector<ColumnFamilyDescriptor>& column_families,
-      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
+      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+      const std::string& compaction_input_files = "");
 
   // EXPERIMENTAL
 

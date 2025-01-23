@@ -7411,12 +7411,18 @@ Status VersionSet::VerifyFileMetadata(const ReadOptions& read_options,
 
     TableCache::TypedHandle* handle = nullptr;
     FileMetaData meta_copy = meta;
+    std::string filename = "./log/remote_compaction.log";
+    std::ofstream outfile;
+    outfile.open(filename, std::ios::app);
+    outfile << "VersionSet::VerifyFileMetadata " << remote_compaction_id_ << std::endl;
+    outfile.close();
+
     status = table_cache->FindTable(
         read_options, file_opts, *icmp, meta_copy, &handle,
         cf_opts->block_protection_bytes_per_key, pe,
         /*no_io=*/false, internal_stats->GetFileReadHist(level), false, level,
         /*prefetch_index_and_filter_in_cache*/ false, max_sz_for_l0_meta_pin,
-        meta_copy.temperature);
+        meta_copy.temperature,remote_compaction_id_);
     if (handle) {
       table_cache->get_cache().Release(handle);
     }
