@@ -630,8 +630,7 @@ Status BlockBasedTable::Open(
     BlockCacheTracer* const block_cache_tracer,
     size_t max_file_size_for_l0_meta_pin, const std::string& cur_db_session_id,
     uint64_t cur_file_num, UniqueId64x2 expected_unique_id,
-    const bool user_defined_timestamps_persisted,
-    const std::string& remote_compaction_id) {
+    const bool user_defined_timestamps_persisted) {
   table_reader->reset();
 
   Status s;
@@ -653,11 +652,15 @@ Status BlockBasedTable::Open(
   bool prefetch_all = prefetch_index_and_filter_in_cache || level == 0;
   const bool preload_all = !table_options.cache_index_and_filter_blocks;
 
+  if (read_options.is_remote_compaction) {
+    prefetch_all = false;
+    ro.is_remote_compaction = read_options.is_remote_compaction;
+  }
   if (!ioptions.allow_mmap_reads && !env_options.use_mmap_reads) {
     s = PrefetchTail(ro, file.get(), file_size, force_direct_prefetch,
                      tail_prefetch_stats, prefetch_all, preload_all,
                      &prefetch_buffer, ioptions.stats, tail_size,
-                     ioptions.logger, remote_compaction_id);
+                     ioptions.logger);
     // Return error in prefetch path to users.
     if (!s.ok()) {
       return s;
@@ -668,12 +671,6 @@ Status BlockBasedTable::Open(
         ReadaheadParams(), false /* enable */, true /* track_min_offset */));
   }
 
-  if (file != nullptr && remote_compaction_id != "") {
-    const std::set<std::string> input_files = CompactionInputFileManager::get_instance()->get_input_files(remote_compaction_id);
-    if (input_files.size() > 0 && input_files.count(file->file_name()) == 0) {
-        prefetch_all = false;
-    }
-  }
   // Read in the following order:
   //    1. Footer
   //    2. [metaindex block]
@@ -707,7 +704,6 @@ Status BlockBasedTable::Open(
       file_size, level, immortal_table, user_defined_timestamps_persisted);
   rep->file = std::move(file);
   rep->footer = footer;
-  rep->remote_compaction_id = remote_compaction_id;
 
   // For fully portable/stable cache keys, we need to read the properties
   // block before setting up cache keys. TODO: consider setting up a bootstrap
@@ -882,7 +878,7 @@ Status BlockBasedTable::PrefetchTail(
     bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
     const bool prefetch_all, const bool preload_all,
     std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer, Statistics* stats,
-    uint64_t tail_size, Logger* const logger, const std::string& remote_compaction_id) {
+    uint64_t tail_size, Logger* const logger) {
   assert(tail_size <= file_size);
 
   size_t tail_prefetch_size = 0;
@@ -919,8 +915,7 @@ Status BlockBasedTable::PrefetchTail(
     }
   }
 
-  const std::set<std::string> input_files = CompactionInputFileManager::get_instance()->get_input_files(remote_compaction_id);
-  if (input_files.size() > 0 && input_files.count(file->file_name()) == 0) {
+  if (ro.is_remote_compaction) {
     tail_prefetch_size = 4 * 1024;
   }
   size_t prefetch_off;

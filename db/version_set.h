@@ -1189,14 +1189,6 @@ class VersionSet {
 
   virtual Status Close(FSDirectory* db_dir, InstrumentedMutex* mu);
 
-  void set_remote_compaction_id(const std::string& remote_compaction_id) {
-    remote_compaction_id_ = remote_compaction_id;
-  }
-
-   const std::string& get_remote_compaction_id() {
-    return remote_compaction_id_;
-  }
-
   Status LogAndApplyToDefaultColumnFamily(
       const ReadOptions& read_options, const WriteOptions& write_options,
       VersionEdit* edit, InstrumentedMutex* mu,
@@ -1722,7 +1714,6 @@ class VersionSet {
 
   // Pointer to the DB's ErrorHandler.
   ErrorHandler* const error_handler_;
-  std::string remote_compaction_id_;
  private:
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
@@ -1779,6 +1770,10 @@ class ReactiveVersionSet : public VersionSet {
 
   std::vector<VersionEdit>& replay_buffer();
 
+  void set_is_remote_compaction(bool is_remote_compaction) {
+      read_options_.is_remote_compaction = is_remote_compaction;
+  }
+
  protected:
   // REQUIRES db mutex
   Status ApplyOneVersionEditToBuilder(
@@ -1792,7 +1787,7 @@ class ReactiveVersionSet : public VersionSet {
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
   // TODO: plumb Env::IOActivity, Env::IOPriority
-  const ReadOptions read_options_;
+  ReadOptions read_options_;
   using VersionSet::LogAndApply;
   using VersionSet::Recover;
 

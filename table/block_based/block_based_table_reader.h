@@ -56,33 +56,6 @@ class GetContext;
 
 using KVPairBlock = std::vector<std::pair<std::string, std::string>>;
 
-
-class CompactionInputFileManager {
-public:
-    static CompactionInputFileManager* get_instance() {
-        static CompactionInputFileManager instance;
-        return &instance;
-    }
-
-    void register_job(const std::string& remote_compaction_id, const std::vector<std::string>& input_files) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& input_file : input_files) {
-            job_map[remote_compaction_id].insert("/" + input_file);
-        }
-    }
-    void finish_job(const std::string& remote_compaction_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        job_map.erase(remote_compaction_id);
-    }
-    const std::set<std::string>& get_input_files(const std::string& remote_compaction_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return job_map[remote_compaction_id];
-    }
-private:
-    std::map<std::string, std::set<std::string> > job_map;
-    std::mutex mutex_;
-};
-
 // Reader class for BlockBasedTable format.
 // For the format of BlockBasedTable refer to
 // https://github.com/facebook/rocksdb/wiki/Rocksdb-BlockBasedTable-Format.
@@ -141,8 +114,7 @@ class BlockBasedTable : public TableReader {
       size_t max_file_size_for_l0_meta_pin = 0,
       const std::string& cur_db_session_id = "", uint64_t cur_file_num = 0,
       UniqueId64x2 expected_unique_id = {},
-      const bool user_defined_timestamps_persisted = true,
-      const std::string& remote_compaction_id = "");
+      const bool user_defined_timestamps_persisted = true);
 
   bool PrefixRangeMayMatch(const Slice& internal_key,
                            const ReadOptions& read_options,
@@ -514,7 +486,7 @@ class BlockBasedTable : public TableReader {
       bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
       const bool prefetch_all, const bool preload_all,
       std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer, Statistics* stats,
-      uint64_t tail_size, Logger* const logger, const std::string& remote_compaction_id);
+      uint64_t tail_size, Logger* const logger);
   Status ReadMetaIndexBlock(const ReadOptions& ro,
                             FilePrefetchBuffer* prefetch_buffer,
                             std::unique_ptr<Block>* metaindex_block,
@@ -600,7 +572,7 @@ struct BlockBasedTable::Rep {
       const BlockBasedTableOptions& _table_opt,
       const InternalKeyComparator& _internal_comparator, bool skip_filters,
       uint64_t _file_size, int _level, const bool _immortal_table,
-      const bool _user_defined_timestamps_persisted = true, const std::string remote_compaction_id = "")
+      const bool _user_defined_timestamps_persisted = true)
       : ioptions(_ioptions),
         env_options(_env_options),
         table_options(_table_opt),
@@ -664,8 +636,6 @@ struct BlockBasedTable::Rep {
 
   // Size of the table file on disk
   uint64_t file_size;
-
-  std::string remote_compaction_id;
 
   // the level when the table is opened, could potentially change when trivial
   // move is involved

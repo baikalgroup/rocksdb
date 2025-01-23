@@ -1624,6 +1624,7 @@ struct DBOptions {
   // functions.
   Temperature wal_write_temperature = Temperature::kUnknown;
   // End EXPERIMENTAL
+  bool is_remote_compaction = false;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -1928,6 +1929,8 @@ struct ReadOptions {
 
   // EXPERIMENTAL
   Env::IOActivity io_activity = Env::IOActivity::kUnknown;
+
+  bool is_remote_compaction = false;
 
   // *** END options for RocksDB internal use only ***
 

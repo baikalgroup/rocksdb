@@ -41,12 +41,6 @@ Status DBImplSecondary::Recover(
     RecoveryContext* /*recovery_ctx*/, bool* /*can_retry*/) {
   mutex_.AssertHeld();
 
-  std::string filename = "./log/remote_compaction.log";
-  std::ofstream outfile;
-  outfile.open(filename, std::ios::app);
-  outfile << "DBImplSecondary::Recover " << static_cast<ReactiveVersionSet*>(versions_.get())->get_remote_compaction_id() << std::endl;
-  outfile.close();
-
   JobContext job_context(0);
   Status s;
   s = static_cast<ReactiveVersionSet*>(versions_.get())
@@ -790,8 +784,7 @@ Status DB::OpenAsSecondary(
     const DBOptions& db_options, const std::string& dbname,
     const std::string& secondary_path,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr, 
-    const std::string& remote_compaction_id) {
+    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
   *dbptr = nullptr;
 
   DBOptions tmp_opts(db_options);
@@ -834,18 +827,7 @@ Status DB::OpenAsSecondary(
       new ColumnFamilyMemTablesImpl(impl->versions_->GetColumnFamilySet()));
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
 
-  size_t pos = secondary_path.rfind('/');
-  if (pos != std::string::npos) {
-      std::string remote_compaction_id = secondary_path.substr(pos + 1);
-      impl->versions_->set_remote_compaction_id(remote_compaction_id);
-  }
-
-  std::string filename = "./log/remote_compaction.log";
-  std::ofstream outfile;
-  outfile.open(filename, std::ios::app);
-  outfile << "OpenAsSecondary " << impl->versions_->get_remote_compaction_id() << std::endl;
-  outfile.close();
-
+  static_cast<ReactiveVersionSet*>(impl->versions_.get())->set_is_remote_compaction(tmp_opts.is_remote_compaction);
   impl->mutex_.Lock();
   s = impl->Recover(column_families, true, false, false);
   if (s.ok()) {
@@ -1019,6 +1001,7 @@ Status DB::OpenAndCompact(
   // We will close the DB after the compaction anyway.
   // Open as many files as needed for the compaction.
   db_options.max_open_files = override_options.max_open_files;
+  db_options.is_remote_compaction = true;
 
   // 4. Filter CFs that are needed for OpenAndCompact()
   // We do not need to open all column families for the remote compaction.
@@ -1075,7 +1058,6 @@ Status DB::OpenAndCompact(
     int64_t compact_without_install_tm = cost.get_time();
     std::string filename = "./log/remote_compaction.log";
     std::ofstream outfile;
-
     outfile.open(filename, std::ios::app);
     if (outfile.is_open()) {
         outfile << "output_directory: " << output_directory 
