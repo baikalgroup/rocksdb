@@ -659,6 +659,10 @@ Status BlockBasedTable::Open(
   const bool prefetch_all = prefetch_index_and_filter_in_cache || level == 0;
   const bool preload_all = !table_options.cache_index_and_filter_blocks;
 
+  if (read_options.is_remote_compaction) {
+    prefetch_all = false;
+    ro.is_remote_compaction = read_options.is_remote_compaction;
+  }
   if (!ioptions.allow_mmap_reads && !env_options.use_mmap_reads) {
     s = PrefetchTail(ro, ioptions, file.get(), file_size, force_direct_prefetch,
                      tail_prefetch_stats, prefetch_all, preload_all,
@@ -904,16 +908,20 @@ Status BlockBasedTable::PrefetchTail(
       // properties, at which point we don't yet know the index type.
       tail_prefetch_size = prefetch_all || preload_all ? 512 * 1024 : 4 * 1024;
 
-      ROCKS_LOG_WARN(
-          logger,
-          "[%s] Tail prefetch size %zu is calculated based on heuristics.",
-          file->file_name().c_str(), tail_prefetch_size);
+    //   ROCKS_LOG_WARN(
+    //       logger,
+    //       "[%s] Tail prefetch size %zu is calculated based on heuristics.",
+    //       file->file_name().c_str(), tail_prefetch_size);
     } else {
-      ROCKS_LOG_WARN(logger,
-                     "[%s] Tail prefetch size %zu is calculated based on "
-                     "TailPrefetchStats.",
-                     file->file_name().c_str(), tail_prefetch_size);
+    //   ROCKS_LOG_WARN(logger,
+    //                  "[%s] Tail prefetch size %zu is calculated based on "
+    //                  "TailPrefetchStats.",
+    //                  file->file_name().c_str(), tail_prefetch_size);
     }
+  }
+  
+  if (ro.is_remote_compaction) {
+    tail_prefetch_size = 4 * 1024;
   }
   size_t prefetch_off;
   size_t prefetch_len;

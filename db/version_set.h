@@ -1165,7 +1165,10 @@ class AtomicGroupReadBuffer {
     return read_edits_in_atomic_group_;
   }
   std::vector<VersionEdit>& replay_buffer() { return replay_buffer_; }
-
+  
+  void set_is_remote_compaction(bool is_remote_compaction) {
+      read_options_.is_remote_compaction = is_remote_compaction;
+  }
  private:
   uint64_t read_edits_in_atomic_group_ = 0;
   std::vector<VersionEdit> replay_buffer_;
@@ -1774,7 +1777,7 @@ class ReactiveVersionSet : public VersionSet {
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
   // TODO: plumb Env::IOActivity, Env::IOPriority
-  const ReadOptions read_options_;
+ReadOptions read_options_;
   using VersionSet::LogAndApply;
   using VersionSet::Recover;
 
