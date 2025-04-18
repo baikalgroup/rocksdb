@@ -403,6 +403,8 @@ struct CompactionServiceInput {
   static Status Read(const std::string& data_str, CompactionServiceInput* obj);
   Status Write(std::string* output);
 
+  bool is_l0_compaction = false;
+
 #ifndef NDEBUG
   bool TEST_Equals(CompactionServiceInput* other);
   bool TEST_Equals(CompactionServiceInput* other, std::string* mismatch);
