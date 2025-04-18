@@ -16,9 +16,6 @@
 #include "rocksdb/utilities/options_util.h"
 #include "util/cast_util.h"
 #include "util/write_batch_util.h"
-#include<iostream> 
-#include <base/time.h>
-#include <fstream>
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -137,27 +134,6 @@ Status DBImplSecondary::FindNewLogNumbers(std::vector<uint64_t>* logs) {
   }
   return s;
 }
-
-class TimeCost {
-public:
-    TimeCost() {
-        _start = base::gettimeofday_us();
-    }
-
-    ~TimeCost() {}
-
-    void reset() {
-        _start = base::gettimeofday_us();
-    }
-
-    int64_t get_time() const {
-        return base::gettimeofday_us() - _start;
-    }
-
-private:
-    int64_t _start;
-};
-
 
 Status DBImplSecondary::MaybeInitLogReader(
     uint64_t log_number, log::FragmentBufferedReader** log_reader) {
@@ -1002,8 +978,6 @@ Status DB::OpenAndCompact(
   // Open as many files as needed for the compaction.
   db_options.max_open_files = override_options.max_open_files;
   db_options.is_remote_compaction = true;
-  db_options.skip_checking_sst_file_sizes_on_db_open = true;
-  db_options.skip_stats_update_on_db_open = true;
 
   // 4. Filter CFs that are needed for OpenAndCompact()
   // We do not need to open all column families for the remote compaction.
@@ -1029,7 +1003,6 @@ Status DB::OpenAndCompact(
       column_families.emplace_back(cf);
     }
   }
-  TimeCost cost;
   // 5. Open db As Secondary
   DB* db;
   std::vector<ColumnFamilyHandle*> handles;
@@ -1039,11 +1012,6 @@ Status DB::OpenAndCompact(
     return s;
   }
   assert(db);
-  int64_t open_as_secondary_tm = cost.get_time();
-
-    std::string filename = "./log/remote_compaction.log";
-    std::ofstream outfile;
-    outfile.open(filename, std::ios::app);
 
   // 6. Find the handle of the Column Family that this will compact
   ColumnFamilyHandle* cfh = nullptr;
@@ -1054,21 +1022,12 @@ Status DB::OpenAndCompact(
     }
   }
   assert(cfh);
-  cost.reset();
   // 7. Run the compaction without installation.
   // Output will be stored in the directory specified by output_directory
   CompactionServiceResult compaction_result;
   DBImplSecondary* db_secondary = static_cast_with_check<DBImplSecondary>(db);
   s = db_secondary->CompactWithoutInstallation(options, cfh, compaction_input,
                                                &compaction_result);
-    int64_t compact_without_install_tm = cost.get_time();
-    if (outfile.is_open()) {
-        outfile << "output_directory: " << output_directory 
-                << ", OpenAsSecondary tm: " << open_as_secondary_tm
-                << ", CompactWithoutInstallation tm: " << compact_without_install_tm << "\n";
-
-        outfile.close(); 
-    }
   // 8. Serialize the result
   Status serialization_status = compaction_result.Write(output);
 
