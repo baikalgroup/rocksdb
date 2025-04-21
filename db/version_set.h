@@ -1714,7 +1714,6 @@ class VersionSet {
 
   // Pointer to the DB's ErrorHandler.
   ErrorHandler* const error_handler_;
-
  private:
   // REQUIRES db mutex at beginning. may release and re-acquire db mutex
   Status ProcessManifestWrites(std::deque<ManifestWriter>& writers,
@@ -1771,6 +1770,10 @@ class ReactiveVersionSet : public VersionSet {
 
   std::vector<VersionEdit>& replay_buffer();
 
+  void set_is_remote_compaction(bool is_remote_compaction) {
+      read_options_.is_remote_compaction = is_remote_compaction;
+  }
+
  protected:
   // REQUIRES db mutex
   Status ApplyOneVersionEditToBuilder(
@@ -1784,7 +1787,7 @@ class ReactiveVersionSet : public VersionSet {
  private:
   std::unique_ptr<ManifestTailer> manifest_tailer_;
   // TODO: plumb Env::IOActivity, Env::IOPriority
-  const ReadOptions read_options_;
+  ReadOptions read_options_;
   using VersionSet::LogAndApply;
   using VersionSet::Recover;
 

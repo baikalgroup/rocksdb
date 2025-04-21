@@ -774,26 +774,25 @@ Status DB::OpenAsSecondary(
   }
 
   assert(tmp_opts.info_log != nullptr);
-  if (db_options.max_open_files != -1) {
-    std::ostringstream oss;
-    oss << "The primary instance may delete all types of files after they "
-           "become obsolete. The application can coordinate the primary and "
-           "secondary so that primary does not delete/rename files that are "
-           "currently being used by the secondary. Alternatively, a custom "
-           "Env/FS can be provided such that files become inaccessible only "
-           "after all primary and secondaries indicate that they are obsolete "
-           "and deleted. If the above two are not possible, you can open the "
-           "secondary instance with `max_open_files==-1` so that secondary "
-           "will eagerly keep all table files open. Even if a file is deleted, "
-           "its content can still be accessed via a prior open file "
-           "descriptor. This is a hacky workaround for only table files. If "
-           "none of the above is done, then point lookup or "
-           "range scan via the secondary instance can result in IOError: file "
-           "not found. This can be resolved by retrying "
-           "TryCatchUpWithPrimary().";
-    ROCKS_LOG_WARN(tmp_opts.info_log, "%s", oss.str().c_str());
-  }
-
+//   if (db_options.max_open_files != -1) {
+//     std::ostringstream oss;
+//     oss << "The primary instance may delete all types of files after they "
+//            "become obsolete. The application can coordinate the primary and "
+//            "secondary so that primary does not delete/rename files that are "
+//            "currently being used by the secondary. Alternatively, a custom "
+//            "Env/FS can be provided such that files become inaccessible only "
+//            "after all primary and secondaries indicate that they are obsolete "
+//            "and deleted. If the above two are not possible, you can open the "
+//            "secondary instance with `max_open_files==-1` so that secondary "
+//            "will eagerly keep all table files open. Even if a file is deleted, "
+//            "its content can still be accessed via a prior open file "
+//            "descriptor. This is a hacky workaround for only table files. If "
+//            "none of the above is done, then point lookup or "
+//            "range scan via the secondary instance can result in IOError: file "
+//            "not found. This can be resolved by retrying "
+//            "TryCatchUpWithPrimary().";
+//     ROCKS_LOG_WARN(tmp_opts.info_log, "%s", oss.str().c_str());
+//   }
   handles->clear();
   DBImplSecondary* impl = new DBImplSecondary(tmp_opts, dbname, secondary_path);
   impl->versions_.reset(new ReactiveVersionSet(
@@ -804,6 +803,7 @@ Status DB::OpenAsSecondary(
       new ColumnFamilyMemTablesImpl(impl->versions_->GetColumnFamilySet()));
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
 
+  static_cast<ReactiveVersionSet*>(impl->versions_.get())->set_is_remote_compaction(tmp_opts.is_remote_compaction);
   impl->mutex_.Lock();
   s = impl->Recover(column_families, true, false, false);
   if (s.ok()) {
@@ -976,7 +976,8 @@ Status DB::OpenAndCompact(
   db_options.compaction_service = nullptr;
   // We will close the DB after the compaction anyway.
   // Open as many files as needed for the compaction.
-  db_options.max_open_files = -1;
+  db_options.max_open_files = override_options.max_open_files;
+  db_options.is_remote_compaction = true;
 
   // 4. Filter CFs that are needed for OpenAndCompact()
   // We do not need to open all column families for the remote compaction.
@@ -1002,7 +1003,6 @@ Status DB::OpenAndCompact(
       column_families.emplace_back(cf);
     }
   }
-
   // 5. Open db As Secondary
   DB* db;
   std::vector<ColumnFamilyHandle*> handles;
@@ -1022,14 +1022,12 @@ Status DB::OpenAndCompact(
     }
   }
   assert(cfh);
-
   // 7. Run the compaction without installation.
   // Output will be stored in the directory specified by output_directory
   CompactionServiceResult compaction_result;
   DBImplSecondary* db_secondary = static_cast_with_check<DBImplSecondary>(db);
   s = db_secondary->CompactWithoutInstallation(options, cfh, compaction_input,
                                                &compaction_result);
-
   // 8. Serialize the result
   Status serialization_status = compaction_result.Write(output);
 
@@ -1056,3 +1054,4 @@ Status DB::OpenAndCompact(
 
 
 }  // namespace ROCKSDB_NAMESPACE
+

@@ -33,7 +33,11 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
 
   const std::vector<CompactionInputFiles>& inputs =
       *(compact_->compaction->inputs());
+  bool is_l0_compaction = true;
   for (const auto& files_per_level : inputs) {
+    if (files_per_level.level != 0) {
+      is_l0_compaction = false;
+    }
     for (const auto& file : files_per_level.files) {
       compaction_input.input_files.emplace_back(
           MakeTableFileName(file->fd.GetNumber()));
@@ -80,7 +84,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       dbname_, db_id_, db_session_id_, GetCompactionId(sub_compact),
       thread_pri_, compaction->compaction_reason(),
       compaction->is_full_compaction(), compaction->is_manual_compaction(),
-      compaction->bottommost_level());
+      compaction->bottommost_level(), is_l0_compaction);
   CompactionServiceScheduleResponse response =
       db_options_.compaction_service->Schedule(info, compaction_input_binary);
   switch (response.status) {
