@@ -31,21 +31,32 @@ CFLAGS('-pipe -g -ggdb -W -Wall -fPIC')
 
 #C++ flags.
 #CXXFLAGS('-std=c++11 -g -pipe -W -Wall -fPIC')
-CXXFLAGS('-std=c++17 -g -ggdb -pipe -W -fPIC -msse -msse4.2 -mpclmul -Wall -fno-omit-frame-pointer -Wno-unused-parameter -Wno-invalid-offsetof')
+CXXFLAGS('-std=c++17 -g -ggdb -pipe -W -fPIC -Wall -fno-omit-frame-pointer -Wno-unused-parameter -Wno-invalid-offsetof')
 
 #-I path
 INCPATHS('. ./include ./third-party/gtest-1.7.0/fused-src ./third-party/fbson')
 
 #link flags
-LDFLAGS('-lpthread -lrt -lz -ldl')
+LDFLAGS('-lpthread -lrt -ldl -lz')
 
-CONFIGS("baidu/third-party/jemalloc@jemalloc_V5.2.0.2_GCC820_6U3_K3_GEN_PD_BL@git_tag")
-CONFIGS('thirdsrc/snappy@snappy_1-0-5-100_PD_BL')
-CONFIGS('baidu/third-party/gflags@gflags_V2.2.2_GCC12_GEN_PD_BL')
-CONFIGS("baidu/third-party/bzip2@1.0.8@git_branch")
-CONFIGS("baidu/third-party/zstd@zstd_V1.4.4.1_GCC820_6U3_K2_GEN_PD_BL@git_branch")   
-CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@git_tag")
+if TARGET_PLATFORM() == 'aarch64':
+    CONFIGS("baidu/third-party/jemalloc@jemalloc_V5.2.1.1_AARCH64_GCC820_GEN_PD_BL@git_tag")
+    CONFIGS("baidu/third-party/snappy@snappy_V1.7.1.3_ARM_GCC820_K4_GEN_PD_BL@git_tag")
+    CONFIGS("baidu/third-party/gflags@gflags_V2.2.2.8_ARM_GCC820_K4_GEN_PD_BL@git_tag")
+    CONFIGS("baidu/third-party/bzip2@bzip2_V1.0.8.2_AARCH64_GCC820_4U3_K3_GEN_PD_BL@git_tag")
+    CONFIGS("baidu/third-party/zstd@zstd_V1.4.0_baidu_kafka_AARCH64_GCC820_GEN_PD_BL@git_tag")
+    CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.1_AARCH64_GCC820_GEN_PD_BL@git_tag")
+else:
+    CXXFLAGS('-msse -msse4.2 -mpclmul')
+    CONFIGS("baidu/third-party/jemalloc@jemalloc_V5.2.0.2_GCC820_6U3_K3_GEN_PD_BL@git_tag")
+    CONFIGS('thirdsrc/snappy@snappy_1-0-5-100_PD_BL')
+    CONFIGS('baidu/third-party/gflags@gflags_V2.2.2_GCC12_GEN_PD_BL')
+    CONFIGS("baidu/third-party/bzip2@1.0.8@git_branch")
+    CONFIGS("baidu/third-party/zstd@zstd_V1.4.4.1_GCC820_6U3_K2_GEN_PD_BL@git_branch")
+    CONFIGS("baidu/third-party/lz4@lz4_V1.9.1.3_GCC820_4U3_K3_GEN_PD_BL@git_tag")
+
 CONFIGS('baidu/base/common@stable')
+
 LIB_SOURCES="""
   cache/cache.cc
   cache/cache_entry_roles.cc
