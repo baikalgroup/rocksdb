@@ -125,6 +125,71 @@ Compaction* FIFOCompactionPicker::PickTTLCompaction(
   return c;
 }
 
+Compaction* FIFOCompactionPicker::PickUserPickerCompaction(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+    LogBuffer* log_buffer) {
+  assert(sst_compaction_picker_ != nullptr);
+
+  const int kLevel0 = 0;
+  const std::vector<FileMetaData*>& level_files = vstorage->LevelFiles(kLevel0);
+
+  if (!level0_compactions_in_progress_.empty()) {
+    ROCKS_LOG_BUFFER(
+        log_buffer,
+        "[%s] FIFO compaction: Already executing compaction. No need "
+        "to run parallel compactions since compactions are very fast",
+        cf_name.c_str());
+    return nullptr;
+  }
+
+  std::vector<CompactionInputFiles> inputs;
+  inputs.emplace_back();
+  inputs[0].level = 0;
+
+  for (auto ritr = level_files.rbegin(); ritr != level_files.rend(); ++ritr) {
+    FileMetaData* f = *ritr;
+    assert(f);
+    bool need_compact = false;
+    Status s = sst_compaction_picker_(*f, need_compact);
+    if (s.ok() && need_compact) {
+      inputs[0].files.push_back(f);
+    } else if (!s.ok()) {
+      ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] FIFO compaction: picker return error, skip file %" PRIu64
+                     " with return status %s",
+                     cf_name.c_str(), f->fd.GetNumber(), s.ToString().c_str());
+    }
+  }
+
+  if (inputs[0].files.empty()) {
+    return nullptr;
+  }
+
+  for (const auto& f : inputs[0].files) {
+    uint64_t creation_time = 0;
+    assert(f);
+    if (f->fd.table_reader && f->fd.table_reader->GetTableProperties()) {
+      creation_time = f->fd.table_reader->GetTableProperties()->creation_time;
+    }
+    ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] FIFO compaction: picking file %" PRIu64
+                     " with creation time %" PRIu64 " for deletion",
+                     cf_name.c_str(), f->fd.GetNumber(), creation_time);
+  }
+
+  Compaction* c = new Compaction(
+      vstorage, ioptions_, mutable_cf_options, mutable_db_options,
+      std::move(inputs), 0, 0, 0, 0, kNoCompression,
+      mutable_cf_options.compression_opts,
+      mutable_cf_options.default_write_temperature,
+      /* max_subcompactions */ 0, {}, /* is manual */ false,
+      /* trim_ts */ "", vstorage->CompactionScore(0),
+      /* is deletion compaction */ true, /* l0_files_might_overlap */ true,
+      CompactionReason::kFIFOTtl);
+  return c;
+}
+
 // The size-based compaction picker for FIFO.
 //
 // When the entire column family size exceeds max_table_files_size, FIFO will
@@ -422,6 +487,12 @@ Compaction* FIFOCompactionPicker::PickCompaction(
     const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
     LogBuffer* log_buffer) {
   Compaction* c = nullptr;
+  if (sst_compaction_picker_ != nullptr) {
+    c = PickUserPickerCompaction(cf_name, mutable_cf_options, mutable_db_options,
+                          vstorage, log_buffer);
+    RegisterCompaction(c);
+    return c;
+  }
   if (mutable_cf_options.ttl > 0) {
     c = PickTTLCompaction(cf_name, mutable_cf_options, mutable_db_options,
                           vstorage, log_buffer);

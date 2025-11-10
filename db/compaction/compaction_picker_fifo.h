@@ -9,14 +9,16 @@
 
 #pragma once
 
+#include <functional>
 #include "db/compaction/compaction_picker.h"
 
 namespace ROCKSDB_NAMESPACE {
 class FIFOCompactionPicker : public CompactionPicker {
  public:
   FIFOCompactionPicker(const ImmutableOptions& ioptions,
-                       const InternalKeyComparator* icmp)
-      : CompactionPicker(ioptions, icmp) {}
+                       const InternalKeyComparator* icmp,
+                       const std::function<Status(const FileMetaData&, bool&)>& sst_compaction_picker)
+      : CompactionPicker(ioptions, icmp), sst_compaction_picker_(sst_compaction_picker) {}
 
   Compaction* PickCompaction(const std::string& cf_name,
                              const MutableCFOptions& mutable_cf_options,
@@ -46,7 +48,11 @@ class FIFOCompactionPicker : public CompactionPicker {
                                 const MutableDBOptions& mutable_db_options,
                                 VersionStorageInfo* version,
                                 LogBuffer* log_buffer);
-
+  Compaction* PickUserPickerCompaction(const std::string& cf_name,
+                                const MutableCFOptions& mutable_cf_options,
+                                const MutableDBOptions& mutable_db_options,
+                                VersionStorageInfo* version,
+                                LogBuffer* log_buffer);
   Compaction* PickSizeCompaction(const std::string& cf_name,
                                  const MutableCFOptions& mutable_cf_options,
                                  const MutableDBOptions& mutable_db_options,
@@ -58,5 +64,7 @@ class FIFOCompactionPicker : public CompactionPicker {
       const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
       const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
       LogBuffer* log_buffer) const;
+
+  std::function<Status(const FileMetaData&, bool&)> sst_compaction_picker_ = nullptr;
 };
 }  // namespace ROCKSDB_NAMESPACE

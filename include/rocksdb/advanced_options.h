@@ -8,20 +8,20 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
-
 #include "rocksdb/cache.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/universal_compaction.h"
 
 namespace ROCKSDB_NAMESPACE {
-
 class Slice;
 class SliceTransform;
 class TablePropertiesCollectorFactory;
 class TableFactory;
 struct Options;
+struct FileMetaData;
 
 enum CompactionStyle : char {
   // level based compaction style
@@ -589,6 +589,12 @@ struct AdvancedColumnFamilyOptions {
 
   // The compaction style. Default: kCompactionStyleLevel
   CompactionStyle compaction_style = kCompactionStyleLevel;
+
+  // When compaction_style == kCompactionStyleFIFO, this callback allows the user
+  // to define custom logic for selecting which SST files should be compacted
+  // (deleted). The function should return Status::OK() to mark a file as
+  // eligible for deletion, or any error Status to skip it.
+  std::function<Status(const FileMetaData&, bool&)> sst_compaction_picker = nullptr;
 
   // If level compaction_style = kCompactionStyleLevel, for each level,
   // which files are prioritized to be picked to compact.
