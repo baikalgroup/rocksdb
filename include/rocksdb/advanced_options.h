@@ -592,9 +592,9 @@ struct AdvancedColumnFamilyOptions {
 
   // When compaction_style == kCompactionStyleFIFO, this callback allows the user
   // to define custom logic for selecting which SST files should be compacted
-  // (deleted). The function should return Status::OK() to mark a file as
-  // eligible for deletion, or any error Status to skip it.
-  std::function<Status(const FileMetaData&, bool&)> sst_compaction_picker = nullptr;
+  // (deleted). The function should return Status::OK() and set bool to true to mark
+  // a file as eligible for deletion, or bool to false to skip it.
+  std::function<Status(std::shared_ptr<const TableProperties>, bool&)> sst_compaction_picker = nullptr;
 
   // If level compaction_style = kCompactionStyleLevel, for each level,
   // which files are prioritized to be picked to compact.

@@ -149,9 +149,18 @@ Compaction* FIFOCompactionPicker::PickUserPickerCompaction(
 
   for (auto ritr = level_files.rbegin(); ritr != level_files.rend(); ++ritr) {
     FileMetaData* f = *ritr;
-    assert(f);
+    assert(f != nullptr);
+    TableReader* table_reader = f->fd.table_reader;
+    if (table_reader == nullptr) {
+      ROCKS_LOG_BUFFER(log_buffer,
+                     "[%s] FIFO compaction: table_reader null, skip file %" PRIu64,
+                     cf_name.c_str(), f->fd.GetNumber());
+      continue;
+    }
+    std::shared_ptr<const TableProperties> table_properties = table_reader->GetTableProperties();
+
     bool need_compact = false;
-    Status s = sst_compaction_picker_(*f, need_compact);
+    Status s = sst_compaction_picker_(table_properties, need_compact);
     if (s.ok() && need_compact) {
       inputs[0].files.push_back(f);
     } else if (!s.ok()) {
@@ -186,7 +195,7 @@ Compaction* FIFOCompactionPicker::PickUserPickerCompaction(
       /* max_subcompactions */ 0, {}, /* is manual */ false,
       /* trim_ts */ "", vstorage->CompactionScore(0),
       /* is deletion compaction */ true, /* l0_files_might_overlap */ true,
-      CompactionReason::kFIFOTtl);
+      CompactionReason::kFIFOUserLogic);
   return c;
 }
 

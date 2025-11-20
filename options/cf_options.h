@@ -89,7 +89,7 @@ struct ImmutableCFOptions {
 
   bool persist_user_defined_timestamps;
 
-  std::function<Status(const FileMetaData&, bool&)> sst_compaction_picker;
+  std::function<Status(std::shared_ptr<const TableProperties>, bool&)> sst_compaction_picker;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {
