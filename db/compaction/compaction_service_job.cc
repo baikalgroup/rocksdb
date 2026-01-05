@@ -98,6 +98,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
                      compaction->column_family_data()->GetName().c_str(),
                      job_id_);
       return response.status;
+    case CompactionServiceJobStatus::kUseRemote:
+      // baikaldb使用存算分离remote compaction，禁止本次compaction，返回CompactionTooLarge不影响rocksdb
+      sub_compact->status = Status::CompactionTooLarge();
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Remote compaction scheduled successfully.",
+          compaction->column_family_data()->GetName().c_str(), job_id_);
+      return CompactionServiceJobStatus::kFailure;
     case CompactionServiceJobStatus::kUseLocal:
       ROCKS_LOG_INFO(
           db_options_.info_log,

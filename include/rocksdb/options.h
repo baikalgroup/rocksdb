@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <set>
 
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/comparator.h"
@@ -453,6 +454,7 @@ enum class CompactionServiceJobStatus : char {
   kSuccess,
   kFailure,
   kUseLocal,
+  kUseRemote,
 };
 
 struct CompactionServiceJobInfo {
@@ -1933,6 +1935,8 @@ struct ReadOptions {
   bool is_remote_compaction = false;
 
   // *** END options for RocksDB internal use only ***
+
+  std::set<std::string> names; // 用于获取指定文件的properties
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);
