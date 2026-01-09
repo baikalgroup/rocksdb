@@ -126,6 +126,8 @@ enum class CompactionReason : int {
   kFIFOMaxSize,
   // [FIFO] reduce number of files.
   kFIFOReduceNumFiles,
+  // [FIFO] user logic
+  kFIFOUserLogic,
   // [FIFO] files with creation time < (current_time - interval)
   kFIFOTtl,
   // Manual compaction
