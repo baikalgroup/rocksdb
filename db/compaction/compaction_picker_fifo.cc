@@ -195,7 +195,7 @@ Compaction* FIFOCompactionPicker::PickUserPickerCompaction(
       /* max_subcompactions */ 0, {}, /* is manual */ false,
       /* trim_ts */ "", vstorage->CompactionScore(0),
       /* is deletion compaction */ true, /* l0_files_might_overlap */ true,
-      CompactionReason::kFIFOUserLogic);
+      CompactionReason::kFIFOTtl);
   return c;
 }
 
