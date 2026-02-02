@@ -88,6 +88,8 @@ struct ImmutableCFOptions {
   std::shared_ptr<Cache> blob_cache;
 
   bool persist_user_defined_timestamps;
+
+  std::function<Status(std::shared_ptr<const TableProperties>, bool&)> sst_compaction_picker;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {
