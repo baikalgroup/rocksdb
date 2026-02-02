@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <set>
 
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/comparator.h"
@@ -453,6 +454,13 @@ enum class CompactionServiceJobStatus : char {
   kSuccess,
   kFailure,
   kUseLocal,
+  kUserDefinedCompaction,
+};
+
+struct InputFileInfo {
+  Slice smallest;
+  Slice largest;
+  InputFileInfo(Slice smallest_, Slice largest_) : smallest(smallest_), largest(largest_) {}
 };
 
 struct CompactionServiceJobInfo {
@@ -472,6 +480,7 @@ struct CompactionServiceJobInfo {
   bool is_manual_compaction;
   bool bottommost_level;
   bool is_l0_compaction;
+  std::vector<InputFileInfo> input_infos;
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
                            std::string db_session_id_, uint64_t job_id_,
                            Env::Priority priority_,
@@ -1933,6 +1942,8 @@ struct ReadOptions {
   bool is_remote_compaction = false;
 
   // *** END options for RocksDB internal use only ***
+
+  std::set<std::string> names; // 用于获取指定文件的properties
 
   ReadOptions() {}
   ReadOptions(bool _verify_checksums, bool _fill_cache);

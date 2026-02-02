@@ -31,6 +31,8 @@
 #include "rocksdb/user_write_callback.h"
 #include "rocksdb/version.h"
 #include "rocksdb/wide_columns.h"
+#include "memory/arena.h"
+#include "table/internal_iterator.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -1006,6 +1008,11 @@ class DB {
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families,
       std::vector<Iterator*>* iterators) = 0;
+
+  // baikaldb使用，内部迭代器，可以获取key是否为delete或put操作
+  virtual InternalIterator* NewInternalIterator(
+      const ReadOptions& read_options, SequenceNumber sequence,
+      ColumnFamilyHandle* column_family, Arena* arena) = 0;
 
   // EXPERIMENTAL
   // Return a cross-column-family iterator from a consistent database state.
@@ -2010,6 +2017,11 @@ class DB {
   virtual Status GetPropertiesOfAllTables(TablePropertiesCollection* props) {
     return GetPropertiesOfAllTables(DefaultColumnFamily(), props);
   }
+
+  // baikaldb使用，获取指定温江的props，否则会遍历所有文件，性能较差
+  virtual Status GetPropertiesOfTables(ColumnFamilyHandle* column_family,
+          TablePropertiesCollection* props, const std::vector<std::string>& names) = 0;
+          
   virtual Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) = 0;

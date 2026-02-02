@@ -265,6 +265,13 @@ class StackableDB : public DB {
     return db_->NewIterator(opts, column_family);
   }
 
+  using DB::NewInternalIterator;
+  InternalIterator* NewInternalIterator(
+    const ReadOptions& read_options, SequenceNumber sequence,
+    ColumnFamilyHandle* column_family, Arena* arena) override {
+    return db_->NewInternalIterator(read_options, sequence, column_family, arena);
+  }
+
   Status NewIterators(const ReadOptions& options,
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override {
@@ -550,6 +557,13 @@ class StackableDB : public DB {
   Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                   TablePropertiesCollection* props) override {
     return db_->GetPropertiesOfAllTables(column_family, props);
+  }
+
+  using DB::GetPropertiesOfTables;
+  Status GetPropertiesOfTables(ColumnFamilyHandle* column_family,
+                                  TablePropertiesCollection* props, const std::vector<std::string>& names) override {
+
+    return db_->GetPropertiesOfTables(column_family, props, names);
   }
 
   using DB::GetPropertiesOfTablesInRange;

@@ -25,7 +25,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   assert(sub_compact);
   assert(sub_compact->compaction);
   assert(db_options_.compaction_service);
-
+  std::vector<InputFileInfo> input_infos;
   const Compaction* compaction = sub_compact->compaction;
   CompactionServiceInput compaction_input;
   compaction_input.output_level = compaction->output_level();
@@ -41,6 +41,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     for (const auto& file : files_per_level.files) {
       compaction_input.input_files.emplace_back(
           MakeTableFileName(file->fd.GetNumber()));
+      input_infos.emplace_back(InputFileInfo(file->smallest.user_key(), file->largest.user_key()));
     }
   }
 
@@ -85,6 +86,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       thread_pri_, compaction->compaction_reason(),
       compaction->is_full_compaction(), compaction->is_manual_compaction(),
       compaction->bottommost_level(), is_l0_compaction);
+  info.input_infos = input_infos;
   CompactionServiceScheduleResponse response =
       db_options_.compaction_service->Schedule(info, compaction_input_binary);
   switch (response.status) {
@@ -98,6 +100,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
                      compaction->column_family_data()->GetName().c_str(),
                      job_id_);
       return response.status;
+    case CompactionServiceJobStatus::kUserDefinedCompaction:
+      // baikaldb使用存算分离remote compaction，禁止本次compaction，返回CompactionTooLarge不影响rocksdb
+      sub_compact->status = Status::CompactionTooLarge();
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Remote compaction scheduled successfully.",
+          compaction->column_family_data()->GetName().c_str(), job_id_);
+      return CompactionServiceJobStatus::kFailure;
     case CompactionServiceJobStatus::kUseLocal:
       ROCKS_LOG_INFO(
           db_options_.info_log,
