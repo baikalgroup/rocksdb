@@ -1612,7 +1612,7 @@ Status DBImpl::CompactFilesImpl(
   }
   mutex_.Lock();
 
-  if (status.ok()) {
+  if (status.ok() || status.IsCompactionTooLarge()) {
     // Done
   } else if (status.IsColumnFamilyDropped() || status.IsShutdownInProgress()) {
     // Ignore compaction errors found during shutting down

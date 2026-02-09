@@ -457,10 +457,11 @@ enum class CompactionServiceJobStatus : char {
   kUserDefinedCompaction,
 };
 
-struct InputFileInfo {
+struct CompactInputFileInfo {
   Slice smallest;
   Slice largest;
-  InputFileInfo(Slice smallest_, Slice largest_) : smallest(smallest_), largest(largest_) {}
+  int level;
+  CompactInputFileInfo(Slice smallest_, Slice largest_, int level_) : smallest(smallest_), largest(largest_), level(level_) {}
 };
 
 struct CompactionServiceJobInfo {
@@ -480,7 +481,7 @@ struct CompactionServiceJobInfo {
   bool is_manual_compaction;
   bool bottommost_level;
   bool is_l0_compaction;
-  std::vector<InputFileInfo> input_infos;
+  std::vector<CompactInputFileInfo> input_infos;
   CompactionServiceJobInfo(std::string db_name_, std::string db_id_,
                            std::string db_session_id_, uint64_t job_id_,
                            Env::Priority priority_,
