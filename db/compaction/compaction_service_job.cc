@@ -25,7 +25,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   assert(sub_compact);
   assert(sub_compact->compaction);
   assert(db_options_.compaction_service);
-  std::vector<InputFileInfo> input_infos;
+  std::vector<CompactInputFileInfo> input_infos;
   const Compaction* compaction = sub_compact->compaction;
   CompactionServiceInput compaction_input;
   compaction_input.output_level = compaction->output_level();
@@ -41,7 +41,7 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     for (const auto& file : files_per_level.files) {
       compaction_input.input_files.emplace_back(
           MakeTableFileName(file->fd.GetNumber()));
-      input_infos.emplace_back(InputFileInfo(file->smallest.user_key(), file->largest.user_key()));
+      input_infos.emplace_back(CompactInputFileInfo(file->smallest.user_key(), file->largest.user_key(), files_per_level.level));
     }
   }
 
