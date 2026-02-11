@@ -41,7 +41,8 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     for (const auto& file : files_per_level.files) {
       compaction_input.input_files.emplace_back(
           MakeTableFileName(file->fd.GetNumber()));
-      input_infos.emplace_back(CompactInputFileInfo(file->smallest.user_key(), file->largest.user_key(), files_per_level.level));
+      input_infos.emplace_back(CompactInputFileInfo(file->smallest.user_key(), file->largest.user_key(), 
+        files_per_level.level, file->fd.file_size));
     }
   }
 

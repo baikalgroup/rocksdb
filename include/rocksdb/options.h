@@ -461,7 +461,9 @@ struct CompactInputFileInfo {
   Slice smallest;
   Slice largest;
   int level;
-  CompactInputFileInfo(Slice smallest_, Slice largest_, int level_) : smallest(smallest_), largest(largest_), level(level_) {}
+  uint64_t file_size;
+  CompactInputFileInfo(Slice smallest_, Slice largest_, int level_, uint64_t file_size_) : 
+    smallest(smallest_), largest(largest_), level(level_), file_size(file_size_) {}
 };
 
 struct CompactionServiceJobInfo {
