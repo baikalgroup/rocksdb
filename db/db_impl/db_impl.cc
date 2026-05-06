@@ -4361,6 +4361,32 @@ Status DBImpl::GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
   return s;
 }
 
+Status DBImpl::GetPropertiesOfTables(ColumnFamilyHandle* column_family,
+                                        TablePropertiesCollection* props, const std::vector<std::string>& names) {
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  auto cfd = cfh->cfd();
+
+  // Increment the ref count
+  mutex_.Lock();
+  auto version = cfd->current();
+  version->Ref();
+  mutex_.Unlock();
+
+  // TODO: plumb Env::IOActivity, Env::IOPriority
+  ReadOptions read_options;
+  for (auto& name : names) {
+    read_options.names.insert(name);
+  }
+  auto s = version->GetPropertiesOfAllTables(read_options, props);
+
+  // Decrement the ref count
+  mutex_.Lock();
+  version->Unref();
+  mutex_.Unlock();
+
+  return s;
+}
+
 Status DBImpl::GetPropertiesOfTablesInRange(ColumnFamilyHandle* column_family,
                                             const Range* range, std::size_t n,
                                             TablePropertiesCollection* props) {

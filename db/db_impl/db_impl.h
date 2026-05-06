@@ -356,6 +356,15 @@ class DBImpl : public DB {
   using DB::NewIterator;
   Iterator* NewIterator(const ReadOptions& _read_options,
                         ColumnFamilyHandle* column_family) override;
+
+  using DB::NewInternalIterator;
+  InternalIterator* NewInternalIterator(
+      const ReadOptions& read_options, SequenceNumber sequence,
+      ColumnFamilyHandle* column_family, Arena* arena) override {
+    return NewInternalIterator(read_options, arena, sequence, column_family,
+                               false);
+  }
+
   Status NewIterators(const ReadOptions& _read_options,
                       const std::vector<ColumnFamilyHandle*>& column_families,
                       std::vector<Iterator*>* iterators) override;
@@ -630,6 +639,9 @@ class DBImpl : public DB {
   using DB::GetPropertiesOfAllTables;
   Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                   TablePropertiesCollection* props) override;
+  using DB::GetPropertiesOfTables;
+  Status GetPropertiesOfTables(ColumnFamilyHandle* column_family,
+                                  TablePropertiesCollection* props, const std::vector<std::string>& names) override;
   Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) override;
