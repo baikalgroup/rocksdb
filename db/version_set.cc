@@ -1708,6 +1708,9 @@ Status Version::GetPropertiesOfAllTables(const ReadOptions& read_options,
     auto fname =
         TableFileName(cfd_->ioptions()->cf_paths, file_meta->fd.GetNumber(),
                       file_meta->fd.GetPathId());
+    if (!read_options.names.empty() && read_options.names.count(fname) <= 0) {
+      continue;
+    }
     // 1. If the table is already present in table cache, load table
     // properties from there.
     std::shared_ptr<const TableProperties> table_properties;
